@@ -598,6 +598,82 @@ pub struct RenderSourceLogic {
     pub script_type: Option<CompactString>,
     pub body: ArcStr,
     pub data_props: Option<CompactString>,
+    pub component: Option<RenderSourceComponentLogic>,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceComponentLogic {
+    pub items: Vec<RenderSourceLogicItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderSourceLogicItem {
+    Local(RenderSourceLocal),
+    State(RenderSourceState),
+    Derived(RenderSourceDerived),
+    Ref(RenderSourceRef),
+    Callback(RenderSourceCallback),
+    Mount(RenderSourceMount),
+    Effect(RenderSourceEffect),
+    Snippet(RenderSourceSnippet),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceLocal {
+    pub body: ArcStr,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceState {
+    pub name: CompactString,
+    pub setter: CompactString,
+    pub initial: CompactString,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceDerived {
+    pub name: CompactString,
+    pub body: CompactString,
+    pub by: bool,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceRef {
+    pub name: CompactString,
+    pub initial: CompactString,
+    pub dom: bool,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceCallback {
+    pub name: CompactString,
+    pub body: CompactString,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceMount {
+    pub body: CompactString,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceEffect {
+    pub dependencies: Vec<CompactString>,
+    pub body: CompactString,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderSourceSnippet {
+    pub name: CompactString,
+    pub params: Vec<CompactString>,
+    pub nodes: Vec<RenderNode>,
     pub span: Option<Span>,
 }
 

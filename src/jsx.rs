@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use arcstr::ArcStr;
@@ -10,7 +10,8 @@ use oxc_ast::ast::{
     Expression, Function, FunctionBody, JSXAttribute, JSXAttributeItem, JSXAttributeName,
     JSXAttributeValue, JSXChild, JSXElement, JSXElementName, JSXExpression, JSXExpressionContainer,
     JSXFragment, JSXMemberExpression, JSXMemberExpressionObject, ModuleExportName,
-    ObjectExpression, ObjectPropertyKind, Program, PropertyKey, Statement,
+    ObjectExpression, ObjectPropertyKind, Program, PropertyKey, Statement, VariableDeclarationKind,
+    VariableDeclarator,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType, Span as OxcSpan};
@@ -23,7 +24,10 @@ use crate::expr::{
 use crate::plan::{
     ComponentId, RenderAttribute, RenderControlFlow, RenderControlFlowHost, RenderControlFlowKind,
     RenderDynamicStyleBinding, RenderElement, RenderLoopLocal, RenderNode, RenderPlan,
-    RenderSourceIntent, RenderSourceLogic, RenderSourceProp, RenderText, UiRole,
+    RenderSourceCallback, RenderSourceComponentLogic, RenderSourceDerived, RenderSourceEffect,
+    RenderSourceIntent, RenderSourceLocal, RenderSourceLogic, RenderSourceLogicItem,
+    RenderSourceMount, RenderSourceProp, RenderSourceRef, RenderSourceSnippet, RenderSourceState,
+    RenderText, UiRole,
 };
 use crate::source::{SourceId, Span};
 use crate::style::StyleDeclaration;
@@ -60,6 +64,15 @@ pub(crate) fn lower_jsx_module(
         source_id,
         diagnostics,
         component_names: BTreeSet::new(),
+        function_components: BTreeMap::new(),
+        published_component_names: BTreeSet::new(),
+        setters: BTreeMap::new(),
+        reactive_names: BTreeSet::new(),
+        refs: BTreeMap::new(),
+        snippets: BTreeSet::new(),
+        source_aliases: BTreeMap::new(),
+        inlined_component_items: Vec::new(),
+        inlining_components: BTreeSet::new(),
     };
     let plan = lowerer.lower_program(&parsed.program);
     Compilation::new(plan, lowerer.diagnostics)
@@ -76,6 +89,15 @@ struct JsxLowerer<'a> {
     source_id: SourceId,
     diagnostics: Diagnostics,
     component_names: BTreeSet<CompactString>,
+    function_components: BTreeMap<CompactString, &'a Function<'a>>,
+    published_component_names: BTreeSet<CompactString>,
+    setters: BTreeMap<CompactString, CompactString>,
+    reactive_names: BTreeSet<CompactString>,
+    refs: BTreeMap<CompactString, bool>,
+    snippets: BTreeSet<CompactString>,
+    source_aliases: BTreeMap<CompactString, CompactString>,
+    inlined_component_items: Vec<RenderSourceLogicItem>,
+    inlining_components: BTreeSet<CompactString>,
 }
 
 struct JsxComponent<'a> {
@@ -84,9 +106,23 @@ struct JsxComponent<'a> {
     module_end: usize,
 }
 
+struct JsxSourceLogicPrelude {
+    body: String,
+    component: Option<RenderSourceComponentLogic>,
+}
+
+struct ComponentPropInit {
+    name: CompactString,
+    default: Option<CompactString>,
+}
+
 impl<'a> JsxLowerer<'a> {
     fn lower_program(&mut self, program: &'a Program<'a>) -> RenderPlan {
         self.component_names = self.discover_component_names(program);
+        self.function_components = self.discover_function_components(program);
+        self.published_component_names = self.discover_published_component_names(program);
+        self.inlined_component_items.clear();
+        self.inlining_components.clear();
         let Some(component) = self.find_component(program) else {
             let mut plan = RenderPlan::new(Vec::new());
             let prelude = self.module_source_logic_prelude(program, usize::MAX);
@@ -97,6 +133,7 @@ impl<'a> JsxLowerer<'a> {
                         script_type: Some("module".into()),
                         body: ArcStr::from(prelude),
                         data_props: None,
+                        component: None,
                         span: None,
                     });
                 }
@@ -123,15 +160,26 @@ impl<'a> JsxLowerer<'a> {
             return RenderPlan::new(Vec::new());
         };
 
-        let mut plan = RenderPlan::new(self.lower_return_expression(return_expression));
-        let prelude = self.source_logic_prelude(program, body, &component);
         let props = self.function_props_pattern(component.function);
-        if !prelude.trim().is_empty() || props.is_some() {
+        self.collect_component_bindings(body, props.as_deref());
+        let mut prelude = self.source_logic_prelude(program, body, &component);
+        let nodes = self.lower_return_expression(return_expression);
+        if !self.inlined_component_items.is_empty() {
+            prelude
+                .component
+                .get_or_insert_with(|| RenderSourceComponentLogic { items: Vec::new() })
+                .items
+                .append(&mut self.inlined_component_items);
+        }
+        let mut plan = RenderPlan::new(nodes);
+        let props = self.function_props_pattern(component.function);
+        if !prelude.body.trim().is_empty() || props.is_some() || prelude.component.is_some() {
             plan.source_logic.push(RenderSourceLogic {
                 dialect: "jsx".into(),
                 script_type: Some("module".into()),
-                body: ArcStr::from(prelude),
+                body: ArcStr::from(prelude.body),
                 data_props: props,
+                component: prelude.component,
                 span: Some(self.span(component.function.span)),
             });
         }
@@ -181,8 +229,98 @@ impl<'a> JsxLowerer<'a> {
         names
     }
 
+    fn discover_function_components(
+        &self,
+        program: &'a Program<'a>,
+    ) -> BTreeMap<CompactString, &'a Function<'a>> {
+        let mut functions = BTreeMap::new();
+        for statement in &program.body {
+            let Statement::FunctionDeclaration(function) = statement else {
+                continue;
+            };
+            let Some(id) = &function.id else {
+                continue;
+            };
+            if component_identifier_name(id.name.as_str())
+                && function_body_contains_jsx(&function.body, self.source)
+            {
+                functions.insert(id.name.as_str().into(), function.as_ref());
+            }
+        }
+        functions
+    }
+
+    fn discover_published_component_names(
+        &self,
+        program: &'a Program<'a>,
+    ) -> BTreeSet<CompactString> {
+        let mut names = BTreeSet::new();
+        for statement in &program.body {
+            match statement {
+                Statement::ExpressionStatement(statement) => {
+                    self.discover_window_object_assign_names(&statement.expression, &mut names);
+                    if let Some(name) = window_assignment_component_name(&statement.expression) {
+                        names.insert(name);
+                    }
+                }
+                Statement::ExportNamedDeclaration(export) => {
+                    if let Some(declaration) = &export.declaration {
+                        self.discover_declaration_component_names(declaration, &mut names);
+                    }
+                }
+                Statement::ExportDefaultDeclaration(export) => {
+                    if let ExportDefaultDeclarationKind::FunctionDeclaration(function) =
+                        &export.declaration
+                        && let Some(id) = &function.id
+                        && component_identifier_name(id.name.as_str())
+                    {
+                        names.insert(id.name.as_str().into());
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
+    }
+
+    fn discover_declaration_component_names(
+        &self,
+        declaration: &Declaration<'a>,
+        names: &mut BTreeSet<CompactString>,
+    ) {
+        match declaration {
+            Declaration::FunctionDeclaration(function) => {
+                if let Some(id) = &function.id
+                    && component_identifier_name(id.name.as_str())
+                {
+                    names.insert(id.name.as_str().into());
+                }
+            }
+            Declaration::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    if let Some(name) = binding_identifier_name(&declarator.id)
+                        && component_identifier_name(name.as_str())
+                    {
+                        names.insert(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn find_component(&self, program: &'a Program<'a>) -> Option<JsxComponent<'a>> {
         if let Some(name) = self.find_window_component_name(program)
+            && let Some(function) = self.find_function_declaration(program, name.as_str())
+        {
+            return Some(JsxComponent {
+                name,
+                function,
+                module_end: function.span.start as usize,
+            });
+        }
+
+        if let Some(name) = self.find_object_assign_component_name(program)
             && let Some(function) = self.find_function_declaration(program, name.as_str())
         {
             return Some(JsxComponent {
@@ -214,6 +352,40 @@ impl<'a> JsxLowerer<'a> {
             };
             Some(CompactString::from(identifier.name.as_str()))
         })
+    }
+
+    fn find_object_assign_component_name(&self, program: &Program<'a>) -> Option<CompactString> {
+        let names = program.body.iter().find_map(|statement| {
+            let Statement::ExpressionStatement(statement) = statement else {
+                return None;
+            };
+            let Expression::CallExpression(call) = &statement.expression else {
+                return None;
+            };
+            if !call_is_object_assign_window(call) {
+                return None;
+            }
+            let Some(Argument::ObjectExpression(object)) = call.arguments.get(1) else {
+                return None;
+            };
+            Some(
+                object
+                    .properties
+                    .iter()
+                    .filter_map(|property| {
+                        let ObjectPropertyKind::ObjectProperty(property) = property else {
+                            return None;
+                        };
+                        self.property_key(&property.key)
+                    })
+                    .filter(|name| {
+                        self.find_function_declaration(program, name.as_str())
+                            .is_some()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        (names.len() > 1).then(|| names[names.len() - 1].clone())
     }
 
     fn find_function_declaration(
@@ -343,35 +515,16 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn source_logic_prelude(
-        &self,
+        &mut self,
         program: &'a Program<'a>,
-        body: &FunctionBody<'a>,
+        body: &'a FunctionBody<'a>,
         component: &JsxComponent<'a>,
-    ) -> String {
+    ) -> JsxSourceLogicPrelude {
         let module = self.module_source_logic_prelude(program, component.module_end);
-        let setup_start = body
-            .statements
-            .first()
-            .map(|statement| statement.span().start as usize)
-            .unwrap_or(body.span.start as usize + 1);
-        let setup_end = body
-            .statements
-            .iter()
-            .find_map(|statement| {
-                matches!(statement, Statement::ReturnStatement(_))
-                    .then(|| statement.span().start as usize)
-            })
-            .unwrap_or((body.span.end as usize).saturating_sub(1));
-        let setup = self
-            .source
-            .get(setup_start..setup_end)
-            .unwrap_or_default()
-            .trim();
-        match (module.is_empty(), setup.is_empty()) {
-            (true, true) => String::new(),
-            (false, true) => module.to_owned(),
-            (true, false) => setup.to_owned(),
-            (false, false) => format!("{module}\n\n{setup}"),
+        let items = self.component_logic_items(body);
+        JsxSourceLogicPrelude {
+            body: module,
+            component: (!items.is_empty()).then_some(RenderSourceComponentLogic { items }),
         }
     }
 
@@ -423,6 +576,651 @@ impl<'a> JsxLowerer<'a> {
         let param = function.params.items.first()?;
         let source = self.source_for_span(param.pattern.span()).trim();
         (!source.is_empty()).then(|| source.into())
+    }
+
+    fn collect_component_bindings(&mut self, body: &FunctionBody<'a>, props: Option<&str>) {
+        self.setters.clear();
+        self.reactive_names.clear();
+        self.refs.clear();
+        self.snippets.clear();
+        self.source_aliases.clear();
+        self.add_component_bindings(body, props);
+    }
+
+    fn add_component_bindings(&mut self, body: &FunctionBody<'a>, props: Option<&str>) {
+        if let Some(props) = props {
+            for local in binding_pattern_locals(props) {
+                self.reactive_names.insert(local.into());
+            }
+        }
+
+        for statement in component_setup_statements(body) {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                continue;
+            };
+            for declarator in &declaration.declarations {
+                if let Some((name, setter, _initial)) = self.use_state_declarator(declarator) {
+                    self.setters.insert(setter, name.clone());
+                    self.reactive_names.insert(name);
+                } else if let Some((name, _body, _by)) = self.use_memo_declarator(declarator) {
+                    self.reactive_names.insert(name);
+                } else if let Some((name, _initial)) = self.use_ref_declarator(declarator) {
+                    self.refs.insert(name, false);
+                }
+            }
+        }
+    }
+
+    fn component_logic_items(&mut self, body: &'a FunctionBody<'a>) -> Vec<RenderSourceLogicItem> {
+        let statements = component_setup_statements(body);
+        let mut items = Vec::new();
+        let mut index = 0usize;
+        while index < statements.len() {
+            if let Some((item, consumed)) = self.derived_block_item(&statements, index) {
+                self.register_logic_item_name(&item);
+                items.push(item);
+                index += consumed;
+                continue;
+            }
+
+            match statements[index] {
+                Statement::VariableDeclaration(declaration) => {
+                    for item in self.variable_logic_items(declaration) {
+                        self.register_logic_item_name(&item);
+                        items.push(item);
+                    }
+                }
+                Statement::ExpressionStatement(statement) => {
+                    if let Some(item) = self.expression_logic_item(&statement.expression) {
+                        if let RenderSourceLogicItem::Derived(derived) = &item {
+                            remove_state_item(&mut items, &derived.name);
+                        }
+                        self.register_logic_item_name(&item);
+                        items.push(item);
+                    } else if let Some((item, source, alias)) =
+                        self.layout_side_derived_item(&statement.expression)
+                    {
+                        self.register_logic_item_name(&item);
+                        self.source_aliases.insert(source, alias);
+                        items.push(item);
+                    } else if self.expression_depends_on_reactive(&statement.expression) {
+                        let dependencies = source_identifier_roots(
+                            self.source_for_span(statement.expression.span()),
+                        )
+                        .into_iter()
+                        .filter(|root| self.reactive_names.contains(root.as_str()))
+                        .map(CompactString::from)
+                        .collect();
+                        items.push(RenderSourceLogicItem::Effect(RenderSourceEffect {
+                            dependencies,
+                            body: self
+                                .rewrite_react_source(self.source_for_span(statement.span).trim())
+                                .into(),
+                            span: Some(self.span(statement.span)),
+                        }));
+                    } else {
+                        let body = self.rewrite_react_source(self.source_for_span(statement.span));
+                        if !body.trim().is_empty() {
+                            items.push(RenderSourceLogicItem::Local(RenderSourceLocal {
+                                body: ArcStr::from(body),
+                                span: Some(self.span(statement.span)),
+                            }));
+                        }
+                    }
+                }
+                Statement::FunctionDeclaration(function) => {
+                    let body = self.rewrite_react_source(self.source_for_span(function.span));
+                    if !body.trim().is_empty() {
+                        items.push(RenderSourceLogicItem::Local(RenderSourceLocal {
+                            body: ArcStr::from(body),
+                            span: Some(self.span(function.span)),
+                        }));
+                    }
+                }
+                statement => {
+                    let body = self.rewrite_react_source(self.source_for_span(statement.span()));
+                    if !body.trim().is_empty() {
+                        items.push(RenderSourceLogicItem::Local(RenderSourceLocal {
+                            body: ArcStr::from(body),
+                            span: Some(self.span(statement.span())),
+                        }));
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        for (name, dom) in self.refs.clone() {
+            if dom {
+                for item in &mut items {
+                    if let RenderSourceLogicItem::Ref(reference) = item
+                        && reference.name == name
+                    {
+                        reference.dom = true;
+                    }
+                }
+            }
+        }
+
+        items
+    }
+
+    fn register_logic_item_name(&mut self, item: &RenderSourceLogicItem) {
+        match item {
+            RenderSourceLogicItem::State(state) => {
+                self.reactive_names.insert(state.name.clone());
+            }
+            RenderSourceLogicItem::Derived(derived) => {
+                self.reactive_names.insert(derived.name.clone());
+            }
+            RenderSourceLogicItem::Ref(reference) => {
+                self.refs
+                    .entry(reference.name.clone())
+                    .or_insert(reference.dom);
+            }
+            RenderSourceLogicItem::Callback(callback) => {
+                self.reactive_names.insert(callback.name.clone());
+            }
+            RenderSourceLogicItem::Snippet(snippet) => {
+                self.snippets.insert(snippet.name.clone());
+            }
+            RenderSourceLogicItem::Local(_)
+            | RenderSourceLogicItem::Mount(_)
+            | RenderSourceLogicItem::Effect(_) => {}
+        }
+    }
+
+    fn variable_logic_items(
+        &mut self,
+        declaration: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    ) -> Vec<RenderSourceLogicItem> {
+        let mut items = Vec::new();
+        for declarator in &declaration.declarations {
+            if let Some((name, setter, initial)) = self.use_state_declarator(declarator) {
+                items.push(RenderSourceLogicItem::State(RenderSourceState {
+                    name,
+                    setter,
+                    initial,
+                    span: Some(self.span(declarator.span)),
+                }));
+                continue;
+            }
+            if let Some((name, body, by)) = self.use_memo_declarator(declarator) {
+                items.push(RenderSourceLogicItem::Derived(RenderSourceDerived {
+                    name,
+                    body,
+                    by,
+                    span: Some(self.span(declarator.span)),
+                }));
+                continue;
+            }
+            if let Some((name, initial)) = self.use_ref_declarator(declarator) {
+                items.push(RenderSourceLogicItem::Ref(RenderSourceRef {
+                    name,
+                    initial,
+                    dom: false,
+                    span: Some(self.span(declarator.span)),
+                }));
+                continue;
+            }
+            if let Some((name, body)) = self.use_callback_declarator(declarator) {
+                items.push(RenderSourceLogicItem::Callback(RenderSourceCallback {
+                    name,
+                    body,
+                    span: Some(self.span(declarator.span)),
+                }));
+                continue;
+            }
+            if let Some(snippet) = self.snippet_declarator(declarator) {
+                items.push(RenderSourceLogicItem::Snippet(snippet));
+                continue;
+            }
+            if let Some((name, body)) = self.arrow_or_function_declarator(declarator) {
+                items.push(RenderSourceLogicItem::Callback(RenderSourceCallback {
+                    name,
+                    body,
+                    span: Some(self.span(declarator.span)),
+                }));
+                continue;
+            }
+            items.push(self.local_or_derived_declarator(declaration.kind, declarator));
+        }
+        items
+    }
+
+    fn local_or_derived_declarator(
+        &mut self,
+        kind: VariableDeclarationKind,
+        declarator: &VariableDeclarator<'a>,
+    ) -> RenderSourceLogicItem {
+        let name = self.binding_source(&declarator.id);
+        let Some(init) = &declarator.init else {
+            let keyword = variable_kind_keyword(kind);
+            return RenderSourceLogicItem::Local(RenderSourceLocal {
+                body: ArcStr::from(format!("{keyword} {name};")),
+                span: Some(self.span(declarator.span)),
+            });
+        };
+        let value = self.rewrite_react_source(self.source_for_span(init.span()).trim());
+        if kind == VariableDeclarationKind::Const && self.expression_depends_on_reactive(init) {
+            RenderSourceLogicItem::Derived(RenderSourceDerived {
+                name,
+                body: value.into(),
+                by: false,
+                span: Some(self.span(declarator.span)),
+            })
+        } else {
+            let keyword = variable_kind_keyword(kind);
+            RenderSourceLogicItem::Local(RenderSourceLocal {
+                body: ArcStr::from(format!("{keyword} {name} = {value};")),
+                span: Some(self.span(declarator.span)),
+            })
+        }
+    }
+
+    fn derived_block_item(
+        &mut self,
+        statements: &[&'a Statement<'a>],
+        index: usize,
+    ) -> Option<(RenderSourceLogicItem, usize)> {
+        let Statement::VariableDeclaration(declaration) = statements.get(index)? else {
+            return None;
+        };
+        if declaration.kind != VariableDeclarationKind::Let || declaration.declarations.len() != 1 {
+            return None;
+        }
+        let declarator = declaration.declarations.first()?;
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        if !self.expression_depends_on_reactive(init) {
+            return None;
+        }
+        let mut consumed = 1usize;
+        let mut body = format!(
+            "let {name} = {};",
+            self.rewrite_react_source(self.source_for_span(init.span()).trim())
+        );
+        while let Some(statement) = statements.get(index + consumed) {
+            if matches!(statement, Statement::ReturnStatement(_)) {
+                break;
+            }
+            let source = self.source_for_span(statement.span());
+            if !source_contains_assignment_to(source, name.as_str()) {
+                break;
+            }
+            body.push('\n');
+            body.push_str(&self.rewrite_react_source(source.trim()));
+            consumed += 1;
+        }
+        if consumed == 1 {
+            return None;
+        }
+        body.push('\n');
+        body.push_str("return ");
+        body.push_str(name.as_str());
+        body.push(';');
+        Some((
+            RenderSourceLogicItem::Derived(RenderSourceDerived {
+                name,
+                body: body.into(),
+                by: true,
+                span: Some(self.span(declarator.span)),
+            }),
+            consumed,
+        ))
+    }
+
+    fn expression_logic_item(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<RenderSourceLogicItem> {
+        let Expression::CallExpression(call) = expression else {
+            return None;
+        };
+        if !call_is_react_hook(call, "useEffect") && !call_is_react_hook(call, "useLayoutEffect") {
+            return None;
+        }
+        self.effect_logic_item(call)
+    }
+
+    fn layout_side_derived_item(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<(RenderSourceLogicItem, CompactString, CompactString)> {
+        let Expression::CallExpression(call) = expression else {
+            return None;
+        };
+        if simple_callee_name(&call.callee)? != "layoutSide" {
+            return None;
+        }
+        let groups = call.arguments.first()?;
+        let groups_source = self.source_for_span(groups.span()).trim();
+        let (root, property) = groups_source.split_once('.')?;
+        if !self.reactive_names.contains(root) || !is_simple_identifier(property) {
+            return None;
+        }
+
+        let alias = self.unique_source_alias(&format!("{property}Groups"));
+        let callee = self.source_for_span(call.callee.span()).trim();
+        let arguments = call
+            .arguments
+            .iter()
+            .skip(1)
+            .map(|argument| self.rewrite_react_source(self.source_for_span(argument.span()).trim()))
+            .collect::<Vec<_>>();
+        let call_arguments = if arguments.is_empty() {
+            "groups".to_owned()
+        } else {
+            format!("groups, {}", arguments.join(", "))
+        };
+        let body = format!(
+            "const groups = {groups_source}.map((group) => ({{
+  ...group,
+  items: group.items.map((item) => ({{ ...item }})),
+}}));
+{callee}({call_arguments});
+return groups;"
+        );
+        Some((
+            RenderSourceLogicItem::Derived(RenderSourceDerived {
+                name: alias.clone(),
+                body: body.into(),
+                by: true,
+                span: Some(self.span(call.span)),
+            }),
+            groups_source.into(),
+            alias,
+        ))
+    }
+
+    fn unique_source_alias(&self, base: &str) -> CompactString {
+        if !self.reactive_names.contains(base)
+            && !self
+                .source_aliases
+                .values()
+                .any(|alias| alias.as_str() == base)
+        {
+            return base.into();
+        }
+        let mut index = 1usize;
+        loop {
+            let candidate = format!("{base}{index}");
+            if !self.reactive_names.contains(candidate.as_str())
+                && !self
+                    .source_aliases
+                    .values()
+                    .any(|alias| alias.as_str() == candidate)
+            {
+                return candidate.into();
+            }
+            index += 1;
+        }
+    }
+
+    fn use_state_declarator(
+        &self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<(CompactString, CompactString, CompactString)> {
+        let OxcBindingPattern::ArrayPattern(pattern) = &declarator.id else {
+            return None;
+        };
+        let init = declarator.init.as_ref()?;
+        let Expression::CallExpression(call) = init else {
+            return None;
+        };
+        if !call_is_react_hook(call, "useState") {
+            return None;
+        }
+        let state = pattern.elements.first()?.as_ref()?;
+        let setter = pattern.elements.get(1)?.as_ref()?;
+        let state = binding_identifier_name(state)?;
+        let setter = binding_identifier_name(setter)?;
+        let initial = call
+            .arguments
+            .first()
+            .map(|argument| self.source_for_span(argument.span()).trim().to_owned())
+            .unwrap_or_else(|| "undefined".to_owned());
+        Some((state, setter, initial.into()))
+    }
+
+    fn use_memo_declarator(
+        &self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<(CompactString, CompactString, bool)> {
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        let Expression::CallExpression(call) = init else {
+            return None;
+        };
+        if !call_is_react_hook(call, "useMemo") {
+            return None;
+        }
+        let callback = call.arguments.first().and_then(argument_arrow_function)?;
+        Some((
+            name,
+            self.arrow_derived_body(callback),
+            !callback.expression,
+        ))
+    }
+
+    fn use_ref_declarator(
+        &self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<(CompactString, CompactString)> {
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        let Expression::CallExpression(call) = init else {
+            return None;
+        };
+        if !call_is_react_hook(call, "useRef") {
+            return None;
+        }
+        let initial = call
+            .arguments
+            .first()
+            .map(|argument| self.source_for_span(argument.span()).trim().to_owned())
+            .unwrap_or_else(|| "undefined".to_owned());
+        Some((name, initial.into()))
+    }
+
+    fn use_callback_declarator(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<(CompactString, CompactString)> {
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        let Expression::CallExpression(call) = init else {
+            return None;
+        };
+        if !call_is_react_hook(call, "useCallback") {
+            return None;
+        }
+        let callback = call.arguments.first()?;
+        Some((
+            name,
+            self.rewrite_react_source(self.source_for_span(callback.span()).trim())
+                .into(),
+        ))
+    }
+
+    fn arrow_or_function_declarator(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<(CompactString, CompactString)> {
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        match init {
+            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => Some((
+                name,
+                self.rewrite_react_source(self.source_for_span(init.span()).trim())
+                    .into(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn snippet_declarator(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+    ) -> Option<RenderSourceSnippet> {
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        let Expression::ArrowFunctionExpression(callback) = init else {
+            return None;
+        };
+        let return_expression = returned_expression(&callback.body)?;
+        if !expression_contains_jsx(return_expression, self.source) {
+            return None;
+        }
+        let params = callback
+            .params
+            .items
+            .iter()
+            .map(|param| self.source_for_span(param.pattern.span()).trim().into())
+            .collect();
+        let nodes = self.lower_return_expression(return_expression);
+        Some(RenderSourceSnippet {
+            name,
+            params,
+            nodes,
+            span: Some(self.span(declarator.span)),
+        })
+    }
+
+    fn effect_logic_item(&mut self, call: &CallExpression<'a>) -> Option<RenderSourceLogicItem> {
+        let callback = call.arguments.first().and_then(argument_arrow_function)?;
+        let dependencies = call
+            .arguments
+            .get(1)
+            .map(|argument| self.effect_dependencies(argument))
+            .unwrap_or_default();
+        if dependencies.is_empty() {
+            return Some(RenderSourceLogicItem::Mount(RenderSourceMount {
+                body: self
+                    .rewrite_react_source(self.arrow_block_body(callback).trim())
+                    .into(),
+                span: Some(self.span(call.span)),
+            }));
+        }
+        if let Some(derived) = self.derived_from_effect(call, callback, &dependencies) {
+            return Some(RenderSourceLogicItem::Derived(derived));
+        }
+        Some(RenderSourceLogicItem::Effect(RenderSourceEffect {
+            dependencies,
+            body: self
+                .rewrite_react_source(self.arrow_block_body(callback).trim())
+                .into(),
+            span: Some(self.span(call.span)),
+        }))
+    }
+
+    fn derived_from_effect(
+        &self,
+        call: &CallExpression<'a>,
+        callback: &ArrowFunctionExpression<'a>,
+        dependencies: &[CompactString],
+    ) -> Option<RenderSourceDerived> {
+        let statements = callback.body.statements.as_slice();
+        if statements.len() != 1 {
+            return None;
+        }
+        let Statement::ExpressionStatement(statement) = &statements[0] else {
+            return None;
+        };
+        let Expression::CallExpression(setter_call) = &statement.expression else {
+            return None;
+        };
+        let setter = simple_callee_name(&setter_call.callee)?;
+        let state = self.setters.get(setter)?;
+        let argument = setter_call.arguments.first()?;
+        let source = self.source_for_span(argument.span()).trim();
+        let roots = source_identifier_roots(source);
+        if !dependencies.iter().any(|dep| roots.contains(dep.as_str())) {
+            return None;
+        }
+        Some(RenderSourceDerived {
+            name: state.clone(),
+            body: source.into(),
+            by: false,
+            span: Some(self.span(call.span)),
+        })
+    }
+
+    fn effect_dependencies(&self, argument: &Argument<'a>) -> Vec<CompactString> {
+        let Argument::ArrayExpression(array) = argument else {
+            return Vec::new();
+        };
+        array
+            .elements
+            .iter()
+            .filter_map(|element| match element {
+                ArrayExpressionElement::Identifier(identifier) => {
+                    Some(CompactString::from(identifier.name.as_str()))
+                }
+                ArrayExpressionElement::StaticMemberExpression(member) => {
+                    Some(self.source_for_span(member.span()).trim().into())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn arrow_derived_body(&self, callback: &ArrowFunctionExpression<'a>) -> CompactString {
+        if callback.expression {
+            return returned_expression(&callback.body)
+                .map(|expression| self.source_for_span(expression.span()).trim().into())
+                .unwrap_or_default();
+        }
+        self.arrow_block_body(callback).trim().into()
+    }
+
+    fn arrow_block_body(&self, callback: &ArrowFunctionExpression<'a>) -> String {
+        if callback.expression {
+            return returned_expression(&callback.body)
+                .map(|expression| {
+                    format!("return {};", self.source_for_span(expression.span()).trim())
+                })
+                .unwrap_or_default();
+        }
+        let source = self.source_for_span(callback.body.span);
+        source
+            .trim()
+            .strip_prefix('{')
+            .and_then(|value| value.strip_suffix('}'))
+            .unwrap_or(source)
+            .trim()
+            .to_owned()
+    }
+
+    fn expression_depends_on_reactive(&self, expression: &Expression<'a>) -> bool {
+        let source = self.source_for_span(expression.span());
+        source_identifier_roots(source)
+            .into_iter()
+            .any(|root| self.reactive_names.contains(root.as_str()))
+    }
+
+    fn binding_source(&self, pattern: &OxcBindingPattern<'a>) -> CompactString {
+        binding_identifier_name(pattern)
+            .unwrap_or_else(|| CompactString::from(self.source_for_span(pattern.span()).trim()))
+    }
+
+    fn rewrite_react_source(&self, source: &str) -> String {
+        rewrite_source_aliases(
+            &rewrite_setter_calls(source, &self.setters),
+            &self.source_aliases,
+        )
+    }
+
+    fn source_alias_for_span(&self, span: OxcSpan) -> Option<CompactString> {
+        let source = self.source_for_span(span).trim();
+        self.source_aliases.get(source).cloned()
+    }
+
+    fn setter_reference_expression(&self, name: &str) -> Option<Expr> {
+        let state = self.setters.get(name)?;
+        Some(Expr::Opaque(
+            format!("(value) => {{ {state} = value; }}").into(),
+        ))
     }
 
     fn lower_return_expression(&mut self, expression: &Expression<'a>) -> Vec<RenderNode> {
@@ -521,11 +1319,141 @@ impl<'a> JsxLowerer<'a> {
         (self.lower_children(&element.children), key)
     }
 
+    fn lower_published_component_inline(
+        &mut self,
+        tag: &str,
+        element: &JSXElement<'a>,
+    ) -> Option<(RenderNode, Option<Expr>)> {
+        if tag.contains('.') || !self.published_component_names.contains(tag) {
+            return None;
+        }
+        let name = CompactString::from(tag);
+        if !self.inlining_components.insert(name.clone()) {
+            return None;
+        }
+
+        let inlined = (|| {
+            let function = self.find_inlinable_function(name.as_str())?;
+            let body = function.body.as_deref()?;
+            let return_expression = returned_expression(body)?;
+            let props_pattern = self.function_props_pattern(function);
+            let props = self.component_call_props(element)?;
+            let prop_items = self.inlined_component_prop_items(props_pattern.as_deref(), &props);
+            for item in prop_items {
+                self.register_logic_item_name(&item);
+                self.inlined_component_items.push(item);
+            }
+            self.add_component_bindings(body, props_pattern.as_deref());
+            let logic_items = self.component_logic_items(body);
+            for item in logic_items {
+                self.inlined_component_items.push(item);
+            }
+
+            let mut nodes = self.lower_return_expression(return_expression);
+            let node = if nodes.len() == 1 {
+                nodes.remove(0)
+            } else {
+                let mut wrapper = self.empty_element("jsx-fragment", element.span);
+                wrapper.children = nodes;
+                RenderNode::Element(Box::new(wrapper))
+            };
+            Some((node, None))
+        })();
+
+        self.inlining_components.remove(&name);
+        inlined
+    }
+
+    fn find_inlinable_function(&self, name: &str) -> Option<&'a Function<'a>> {
+        self.function_components.get(name).copied()
+    }
+
+    fn component_call_props(
+        &mut self,
+        element: &JSXElement<'a>,
+    ) -> Option<BTreeMap<CompactString, CompactString>> {
+        let mut props = BTreeMap::new();
+        for attribute in &element.opening_element.attributes {
+            match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    let name = self.jsx_attribute_name(&attribute.name);
+                    if name == "key" {
+                        continue;
+                    }
+                    let value = match &attribute.value {
+                        None => "true".to_owned(),
+                        Some(JSXAttributeValue::StringLiteral(value)) => {
+                            format!("{:?}", value.value.as_str())
+                        }
+                        Some(JSXAttributeValue::ExpressionContainer(container)) => self
+                            .rewrite_react_source(
+                                self.source_for_span(container.expression.span()).trim(),
+                            ),
+                        Some(other) => {
+                            self.unsupported_attribute_value(other);
+                            return None;
+                        }
+                    };
+                    props.insert(name, value.into());
+                }
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    self.diagnostics.push(Diagnostic::warning(
+                        "JSX component spreads are not inlined; emitted placeholder",
+                        Some(self.span(spread.span)),
+                    ));
+                    return None;
+                }
+            }
+        }
+        Some(props)
+    }
+
+    fn inlined_component_prop_items(
+        &self,
+        props_pattern: Option<&str>,
+        call_props: &BTreeMap<CompactString, CompactString>,
+    ) -> Vec<RenderSourceLogicItem> {
+        let Some(props_pattern) = props_pattern else {
+            return Vec::new();
+        };
+        component_props_from_pattern(props_pattern)
+            .into_iter()
+            .filter_map(|prop| {
+                let value = call_props
+                    .get(prop.name.as_str())
+                    .cloned()
+                    .or(prop.default)?;
+                if self.reactive_names.contains(prop.name.as_str()) && value == prop.name {
+                    return None;
+                }
+                let reactive = source_identifier_roots(value.as_str())
+                    .into_iter()
+                    .any(|root| self.reactive_names.contains(root.as_str()));
+                if reactive {
+                    Some(RenderSourceLogicItem::Derived(RenderSourceDerived {
+                        name: prop.name,
+                        body: value,
+                        by: false,
+                        span: None,
+                    }))
+                } else {
+                    Some(RenderSourceLogicItem::Local(RenderSourceLocal {
+                        body: ArcStr::from(format!("const {} = {};", prop.name, value)),
+                        span: None,
+                    }))
+                }
+            })
+            .collect()
+    }
+
     fn lower_component_element(
         &mut self,
         tag: &str,
         element: &JSXElement<'a>,
     ) -> (RenderNode, Option<Expr>) {
+        if let Some(inlined) = self.lower_published_component_inline(tag, element) {
+            return inlined;
+        }
         let component = component_reference_name(tag);
         let mut render = self.empty_element("jsx-component", element.span);
         let mut key = None;
@@ -648,6 +1576,29 @@ impl<'a> JsxLowerer<'a> {
                 .value
                 .as_ref()
                 .and_then(|value| self.attribute_expr(value));
+            return true;
+        }
+        if raw_name == "ref" {
+            if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value {
+                let name = self
+                    .source_for_span(container.expression.span())
+                    .trim()
+                    .to_owned();
+                if is_simple_identifier(&name) {
+                    self.refs.insert(CompactString::from(name.as_str()), true);
+                    element.attributes.push(RenderAttribute {
+                        name: "bind:this".into(),
+                        value: CompactString::from(name.as_str()),
+                        template: None,
+                        span: Some(self.span(attribute.span)),
+                    });
+                } else {
+                    self.diagnostics.push(Diagnostic::warning(
+                        "JSX ref attributes must be simple identifiers for Svelte bind:this",
+                        Some(self.span(attribute.span)),
+                    ));
+                }
+            }
             return true;
         }
         let name = react_attribute_name(&raw_name);
@@ -1005,10 +1956,73 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn lower_call_child(&mut self, call: &CallExpression<'a>) -> Option<Vec<RenderNode>> {
+        if let Some(node) = self.lower_snippet_call(call) {
+            return Some(vec![node]);
+        }
+        if let Some(node) = self.lower_flat_map_call(call) {
+            return Some(vec![node]);
+        }
         if let Some(node) = self.lower_map_call(call) {
             return Some(vec![node]);
         }
         self.lower_iife_call(call)
+    }
+
+    fn lower_snippet_call(&mut self, call: &CallExpression<'a>) -> Option<RenderNode> {
+        let name = simple_callee_name(&call.callee)?;
+        if !self.snippets.contains(name) {
+            return None;
+        }
+        let mut render = self.empty_element("jsx-render", call.span);
+        render.attributes.push(RenderAttribute {
+            name: "data-htmlswap-render".into(),
+            value: self
+                .rewrite_react_source(self.source_for_span(call.span).trim())
+                .into(),
+            template: None,
+            span: Some(self.span(call.span)),
+        });
+        Some(RenderNode::Element(Box::new(render)))
+    }
+
+    fn lower_flat_map_call(&mut self, call: &CallExpression<'a>) -> Option<RenderNode> {
+        let Expression::StaticMemberExpression(member) = &call.callee else {
+            return None;
+        };
+        if member.property.name.as_str() != "flatMap" {
+            return None;
+        }
+        let argument = call.arguments.first()?;
+        let callback = argument_arrow_function(argument)?;
+        let binding = callback
+            .params
+            .items
+            .first()
+            .and_then(|param| self.callback_binding(&param.pattern))?;
+        let index_binding = callback
+            .params
+            .items
+            .get(1)
+            .and_then(|param| self.callback_binding(&param.pattern));
+        let expression = returned_expression(&callback.body)?;
+        let Expression::CallExpression(inner_call) = expression else {
+            return None;
+        };
+        let child = self.lower_map_call(inner_call)?;
+        let mut wrapper = self.empty_element("jsx-each", call.span);
+        wrapper.control_flow = Some(Box::new(RenderControlFlow {
+            kind: RenderControlFlowKind::For,
+            host: RenderControlFlowHost::Wrapper,
+            expression: Some(self.lower_expression(&member.object)),
+            binding: Some(binding),
+            index_binding,
+            key: None,
+            locals: self.callback_locals(callback),
+            placeholder: None,
+            span: Some(self.span(call.span)),
+        }));
+        wrapper.children = vec![child];
+        Some(RenderNode::Element(Box::new(wrapper)))
     }
 
     fn lower_conditional_child(
@@ -1317,7 +2331,10 @@ impl<'a> JsxLowerer<'a> {
                 };
                 locals.push(RenderLoopLocal {
                     name,
-                    value: Expr::Opaque(self.source_for_span(init.span()).into()),
+                    value: Expr::Opaque(
+                        self.rewrite_react_source(self.source_for_span(init.span()))
+                            .into(),
+                    ),
                     span: Some(self.span(declarator.span)),
                 });
             }
@@ -1356,8 +2373,13 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn lower_jsx_expression(&mut self, expression: &JSXExpression<'a>) -> Expr {
+        if let Some(alias) = self.source_alias_for_span(expression.span()) {
+            return Expr::path([alias.as_str()]);
+        }
         match expression {
-            JSXExpression::Identifier(identifier) => Expr::path([identifier.name.as_str()]),
+            JSXExpression::Identifier(identifier) => self
+                .setter_reference_expression(identifier.name.as_str())
+                .unwrap_or_else(|| Expr::path([identifier.name.as_str()])),
             JSXExpression::StaticMemberExpression(member) => Expr::Member {
                 object: Box::new(self.lower_expression(&member.object)),
                 property: member.property.name.as_str().into(),
@@ -1401,13 +2423,21 @@ impl<'a> JsxLowerer<'a> {
                 self.lower_expression(&expression.expression)
             }
             JSXExpression::EmptyExpression(_) => Expr::Opaque(CompactString::new("")),
-            _ => Expr::Opaque(self.source_for_span(expression.span()).into()),
+            _ => Expr::Opaque(
+                self.rewrite_react_source(self.source_for_span(expression.span()))
+                    .into(),
+            ),
         }
     }
 
     fn lower_expression(&mut self, expression: &Expression<'a>) -> Expr {
+        if let Some(alias) = self.source_alias_for_span(expression.span()) {
+            return Expr::path([alias.as_str()]);
+        }
         match expression {
-            Expression::Identifier(identifier) => Expr::path([identifier.name.as_str()]),
+            Expression::Identifier(identifier) => self
+                .setter_reference_expression(identifier.name.as_str())
+                .unwrap_or_else(|| Expr::path([identifier.name.as_str()])),
             Expression::StaticMemberExpression(member) => Expr::Member {
                 object: Box::new(self.lower_expression(&member.object)),
                 property: member.property.name.as_str().into(),
@@ -1450,17 +2480,33 @@ impl<'a> JsxLowerer<'a> {
             Expression::ParenthesizedExpression(expression) => {
                 self.lower_expression(&expression.expression)
             }
-            _ => Expr::Opaque(self.source_for_span(expression.span()).into()),
+            _ => Expr::Opaque(
+                self.rewrite_react_source(self.source_for_span(expression.span()))
+                    .into(),
+            ),
         }
     }
 
     fn lower_call_expression(&mut self, call: &CallExpression<'a>) -> Expr {
+        if let Some(name) = simple_callee_name(&call.callee)
+            && self.setters.contains_key(name)
+        {
+            return Expr::Opaque(
+                self.rewrite_react_source(self.source_for_span(call.span))
+                    .into(),
+            );
+        }
         Expr::Call {
             callee: Box::new(self.lower_expression(&call.callee)),
             arguments: call
                 .arguments
                 .iter()
-                .map(|argument| Expr::Opaque(self.source_for_span(argument.span()).into()))
+                .map(|argument| {
+                    Expr::Opaque(
+                        self.rewrite_react_source(self.source_for_span(argument.span()))
+                            .into(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -1474,7 +2520,10 @@ impl<'a> JsxLowerer<'a> {
                     if matches!(element, ArrayExpressionElement::Elision(_)) {
                         None
                     } else {
-                        Some(Expr::Opaque(self.source_for_span(element.span()).into()))
+                        Some(Expr::Opaque(
+                            self.rewrite_react_source(self.source_for_span(element.span()))
+                                .into(),
+                        ))
                     }
                 })
                 .collect(),
@@ -1638,6 +2687,22 @@ fn assignment_target_is_window_member(target: &AssignmentTarget<'_>) -> bool {
         return false;
     };
     matches!(&member.object, Expression::Identifier(identifier) if identifier.name.as_str() == "window")
+}
+
+fn window_assignment_component_name(expression: &Expression<'_>) -> Option<CompactString> {
+    let Expression::AssignmentExpression(assignment) = expression else {
+        return None;
+    };
+    if assignment.operator != AssignmentOperator::Assign
+        || !assignment_target_is_window_member(&assignment.left)
+    {
+        return None;
+    }
+    let Expression::Identifier(identifier) = &assignment.right else {
+        return None;
+    };
+    component_identifier_name(identifier.name.as_str())
+        .then(|| CompactString::from(identifier.name.as_str()))
 }
 
 fn module_export_name(name: &ModuleExportName<'_>) -> Option<CompactString> {
@@ -1812,6 +2877,463 @@ fn binding_identifier_name(pattern: &OxcBindingPattern<'_>) -> Option<CompactStr
     }
 }
 
+fn remove_state_item(items: &mut Vec<RenderSourceLogicItem>, name: &str) {
+    items.retain(|item| {
+        !matches!(
+            item,
+            RenderSourceLogicItem::State(RenderSourceState { name: state_name, .. })
+                if state_name == name
+        )
+    });
+}
+
+fn component_setup_statements<'b, 'a>(body: &'b FunctionBody<'a>) -> Vec<&'b Statement<'a>> {
+    body.statements
+        .iter()
+        .take_while(|statement| !matches!(statement, Statement::ReturnStatement(_)))
+        .collect()
+}
+
+fn variable_kind_keyword(kind: VariableDeclarationKind) -> &'static str {
+    match kind {
+        VariableDeclarationKind::Var => "var",
+        VariableDeclarationKind::Let => "let",
+        VariableDeclarationKind::Const => "const",
+        VariableDeclarationKind::Using => "using",
+        VariableDeclarationKind::AwaitUsing => "await using",
+    }
+}
+
+fn call_is_react_hook(call: &CallExpression<'_>, hook: &str) -> bool {
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return false;
+    };
+    member.property.name.as_str() == hook
+        && matches!(&member.object, Expression::Identifier(identifier) if identifier.name.as_str() == "React")
+}
+
+fn simple_callee_name<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b str> {
+    match expression {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str()),
+        _ => None,
+    }
+}
+
+fn source_contains_assignment_to(source: &str, name: &str) -> bool {
+    let mut offset = 0usize;
+    while let Some(index) = find_identifier(source, name, offset) {
+        let cursor = skip_ascii_whitespace(source, index + name.len());
+        if source[cursor..].starts_with('=') && !source[cursor..].starts_with("==") {
+            return true;
+        }
+        offset = index + name.len();
+    }
+    false
+}
+
+fn source_identifier_roots(source: &str) -> BTreeSet<String> {
+    let mut roots = BTreeSet::new();
+    let mut cursor = 0usize;
+    while cursor < source.len() {
+        if let Some((name, end)) = scan_identifier_at(source, cursor) {
+            if !JS_RESERVED_ROOTS.contains(&name) {
+                roots.insert(name.to_owned());
+            }
+            cursor = end;
+            continue;
+        }
+        cursor += char_at(source, cursor).map_or(1, char::len_utf8);
+    }
+    roots
+}
+
+fn binding_pattern_locals(source: &str) -> Vec<String> {
+    source_identifier_roots(source).into_iter().collect()
+}
+
+fn component_props_from_pattern(source: &str) -> Vec<ComponentPropInit> {
+    let trimmed = source.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    split_top_level_commas(inner)
+        .into_iter()
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() || part.starts_with("...") || part.contains(':') {
+                return None;
+            }
+            let (name, default) = part
+                .split_once('=')
+                .map_or((part, None), |(name, default)| {
+                    (name.trim(), Some(default.trim()))
+                });
+            is_simple_identifier(name).then(|| ComponentPropInit {
+                name: name.into(),
+                default: default.map(CompactString::from),
+            })
+        })
+        .collect()
+}
+
+fn split_top_level_commas(source: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < source.len() {
+        let ch = char_at(source, cursor).expect("cursor is within source");
+        let next = cursor + ch.len_utf8();
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                cursor = next;
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                cursor = next;
+            }
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                cursor = next;
+            }
+            ',' if depth == 0 => {
+                parts.push(&source[start..cursor]);
+                cursor = next;
+                start = cursor;
+            }
+            _ => cursor = next,
+        }
+    }
+    parts.push(&source[start..]);
+    parts
+}
+
+fn rewrite_setter_calls(source: &str, setters: &BTreeMap<CompactString, CompactString>) -> String {
+    if setters.is_empty() {
+        return source.to_owned();
+    }
+
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while cursor < source.len() {
+        let Some((name, name_end)) = scan_identifier_at(source, cursor) else {
+            let ch = char_at(source, cursor).expect("cursor is within source");
+            output.push(ch);
+            cursor += ch.len_utf8();
+            continue;
+        };
+
+        let Some(state) = setters.get(name) else {
+            output.push_str(name);
+            cursor = name_end;
+            continue;
+        };
+
+        let paren = skip_ascii_whitespace(source, name_end);
+        if !source[paren..].starts_with('(') {
+            output.push_str(name);
+            cursor = name_end;
+            continue;
+        }
+        let Some(call_end) = scan_balanced(source, paren, '(', ')') else {
+            output.push_str(name);
+            cursor = name_end;
+            continue;
+        };
+        let args = &source[paren + 1..call_end - 1];
+        let first_arg = first_call_argument(args).trim();
+        if first_arg.is_empty() {
+            output.push_str(name);
+            cursor = name_end;
+            continue;
+        }
+        let first_arg = rewrite_setter_calls(first_arg, setters);
+        if top_level_contains_arrow(&first_arg) {
+            output.push_str(&format!("{state} = ({first_arg})({state})"));
+        } else {
+            output.push_str(&format!("{state} = {first_arg}"));
+        }
+        cursor = call_end;
+    }
+    output
+}
+
+fn rewrite_source_aliases(
+    source: &str,
+    aliases: &BTreeMap<CompactString, CompactString>,
+) -> String {
+    if aliases.is_empty() {
+        return source.to_owned();
+    }
+    aliases
+        .iter()
+        .fold(source.to_owned(), |rewritten, (from, to)| {
+            replace_source_alias(&rewritten, from.as_str(), to.as_str())
+        })
+}
+
+fn replace_source_alias(source: &str, from: &str, to: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = source[cursor..].find(from) {
+        let index = cursor + relative;
+        let end = index + from.len();
+        let before_ok = source[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_continue(ch) && ch != '.');
+        let after_ok = source[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_continue(ch));
+        if before_ok && after_ok {
+            output.push_str(&source[cursor..index]);
+            output.push_str(to);
+            cursor = end;
+        } else {
+            output.push_str(&source[cursor..end]);
+            cursor = end;
+        }
+    }
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn first_call_argument(args: &str) -> &str {
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < args.len() {
+        let ch = char_at(args, cursor).expect("cursor is within args");
+        let next = cursor + ch.len_utf8();
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return &args[..cursor],
+            _ => {}
+        }
+        cursor = next;
+    }
+    args
+}
+
+fn top_level_contains_arrow(value: &str) -> bool {
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while cursor < value.len() {
+        let ch = char_at(value, cursor).expect("cursor is within value");
+        let next = cursor + ch.len_utf8();
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '\'' | '"' | '`' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 && value[next..].starts_with('>') => return true,
+            _ => {}
+        }
+        cursor = next;
+    }
+    false
+}
+
+fn scan_balanced(source: &str, start: usize, open: char, close: char) -> Option<usize> {
+    let mut cursor = start;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while cursor < source.len() {
+        let ch = char_at(source, cursor)?;
+        let next = cursor + ch.len_utf8();
+        if line_comment {
+            line_comment = ch != '\n';
+            cursor = next;
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && char_at(source, next) == Some('/') {
+                block_comment = false;
+                cursor = next + 1;
+            } else {
+                cursor = next;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '/' if char_at(source, next) == Some('/') => {
+                line_comment = true;
+                cursor = next + 1;
+            }
+            '/' if char_at(source, next) == Some('*') => {
+                block_comment = true;
+                cursor = next + 1;
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                cursor = next;
+            }
+            ch if ch == open => {
+                depth += 1;
+                cursor = next;
+            }
+            ch if ch == close => {
+                depth = depth.saturating_sub(1);
+                cursor = next;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor = next,
+        }
+    }
+    None
+}
+
+fn find_identifier(source: &str, name: &str, mut offset: usize) -> Option<usize> {
+    while let Some(relative) = source[offset..].find(name) {
+        let index = offset + relative;
+        let end = index + name.len();
+        let before_ok = source[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_continue(ch));
+        let after_ok = source[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_continue(ch));
+        if before_ok && after_ok {
+            return Some(index);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn scan_identifier_at(source: &str, start: usize) -> Option<(&str, usize)> {
+    let mut chars = source[start..].char_indices();
+    let (_, first) = chars.next()?;
+    if !is_identifier_start(first) {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (relative, ch) in chars {
+        if !is_identifier_continue(ch) {
+            break;
+        }
+        end = start + relative + ch.len_utf8();
+    }
+    Some((&source[start..end], end))
+}
+
+fn skip_ascii_whitespace(source: &str, mut cursor: usize) -> usize {
+    while let Some(byte) = source.as_bytes().get(cursor) {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        cursor += 1;
+    }
+    cursor
+}
+
+fn char_at(source: &str, cursor: usize) -> Option<char> {
+    source.get(cursor..)?.chars().next()
+}
+
+fn is_simple_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    is_identifier_start(first) && chars.all(is_identifier_continue)
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    is_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+const JS_RESERVED_ROOTS: &[&str] = &[
+    "Array",
+    "Boolean",
+    "Date",
+    "Error",
+    "JSON",
+    "Math",
+    "Number",
+    "Object",
+    "Promise",
+    "React",
+    "String",
+    "console",
+    "document",
+    "event",
+    "false",
+    "function",
+    "if",
+    "let",
+    "null",
+    "return",
+    "this",
+    "true",
+    "undefined",
+    "window",
+];
+
 fn flush_text(
     nodes: &mut Vec<RenderNode>,
     segments: &mut Vec<TemplateSegment>,
@@ -1875,11 +3397,27 @@ fn react_attribute_name(name: &str) -> CompactString {
         "htmlFor" => "for".into(),
         "defaultValue" => "value".into(),
         "defaultChecked" => "checked".into(),
+        _ if react_event_attribute_name(name).is_some() => react_event_attribute_name(name)
+            .expect("checked above")
+            .into(),
         _ if name.starts_with("aria-") || name.starts_with("data-") => name.into(),
         _ if let Some(mapped) = react_attribute_alias(name) => mapped.into(),
         _ if name.chars().any(char::is_uppercase) => camel_to_kebab(name).into(),
         _ => name.into(),
     }
+}
+
+fn react_event_attribute_name(name: &str) -> Option<String> {
+    let event = name.strip_prefix("on")?;
+    let first = event.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    let normalized = match event {
+        "DoubleClick" => "dblclick".to_owned(),
+        _ => event.to_ascii_lowercase(),
+    };
+    Some(format!("on{normalized}"))
 }
 
 fn react_attribute_alias(name: &str) -> Option<&'static str> {

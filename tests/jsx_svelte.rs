@@ -45,7 +45,8 @@ fn emits_graph_banded_svelte_phase_zero_surface() {
 
     assert!(code.contains("<script lang=\"ts\">"));
     assert!(code.contains("const SECTORS = ["));
-    assert!(code.contains("const W = 420, H = 260;"));
+    assert!(code.contains("const W = 420;"));
+    assert!(code.contains("const H = 260;"));
     assert!(code.contains("<svg"));
     assert!(code.contains("{#each [60, 90] as r (r)}"));
     assert!(code.contains("{#each SECTORS as s, i (s.rel)}"));
@@ -149,7 +150,7 @@ window.Demo = Demo;
 
 #[test]
 fn emits_inline_style_block_and_component_references() {
-    let code = emit_svelte_jsx(
+    let (code, diagnostics) = emit_svelte_jsx_with_diagnostics(
         r#"
 function Demo() {
   return <div><TopBar /><style>{`@keyframes blink { 0% { opacity: 1 } 100% { opacity: 0 } }`}</style></div>;
@@ -158,20 +159,28 @@ window.Demo = Demo;
 "#,
     );
 
+    assert_eq!(
+        diagnostics,
+        ["JSX component tag `TopBar` is outside Phase 1 scope; emitted placeholder"]
+    );
     assert!(code.contains("<style>"), "{code}");
     assert!(code.contains("@keyframes blink"), "{code}");
     assert!(!code.contains("<style>{"), "{code}");
-    assert!(code.contains("let { TopBar }"), "{code}");
-    assert!(code.contains("<TopBar>"), "{code}");
     assert!(
-        !code.contains("htmlswap-jsx-component-placeholder"),
+        code.contains("htmlswap-jsx-component-placeholder"),
         "{code}"
     );
+    assert!(
+        code.contains("[unsupported JSX component: TopBar]"),
+        "{code}"
+    );
+    assert!(!code.contains("let { TopBar }"), "{code}");
+    assert!(!code.contains("<TopBar>"), "{code}");
 }
 
 #[test]
 fn emits_component_spreads_and_member_component_refs() {
-    let code = emit_svelte_jsx(
+    let (code, diagnostics) = emit_svelte_jsx_with_diagnostics(
         r#"
 function Demo() {
   const props = { title: 'Find' };
@@ -181,16 +190,21 @@ window.Demo = Demo;
 "#,
     );
 
-    assert!(code.contains("let { IconSearch }"), "{code}");
+    assert_eq!(
+        diagnostics,
+        ["JSX component tag `Icon.search` is outside Phase 1 scope; emitted placeholder"]
+    );
     assert!(
-        code.contains("<IconSearch {...props} size={12} className=\"icon\">"),
+        code.contains("htmlswap-jsx-component-placeholder"),
         "{code}"
     );
+    assert!(
+        code.contains("[unsupported JSX component: Icon.search]"),
+        "{code}"
+    );
+    assert!(!code.contains("let { IconSearch }"), "{code}");
+    assert!(!code.contains("<IconSearch"), "{code}");
     assert!(!code.contains("<Icon.search"), "{code}");
-    assert!(
-        !code.contains("htmlswap-jsx-component-placeholder"),
-        "{code}"
-    );
 }
 
 #[test]
@@ -262,4 +276,51 @@ window.Demo = Demo;
     assert!(code.contains("{@const x = 1}"), "{code}");
     assert!(code.contains("{@const y = x + 1}"), "{code}");
     assert!(!code.contains("return <text"), "{code}");
+}
+
+#[test]
+fn emits_react_hooks_as_svelte_runes_and_lifecycle_intents() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo({ first }) {
+  const [count, setCount] = React.useState(0);
+  const [label, setLabel] = React.useState('');
+  const doubled = React.useMemo(() => count * 2, [count]);
+  const inputRef = React.useRef(null);
+  const bump = React.useCallback(() => setCount(c => c + 1), [count]);
+  const sync = () => setLabel(value => { setCount(count + 1); return value; });
+  React.useEffect(() => { setLabel(first + ':' + count); }, [first, count]);
+  React.useEffect(() => { const id = setInterval(() => console.log(count), 1000); return () => clearInterval(id); }, []);
+  React.useEffect(() => { console.log(count); }, [count]);
+  return <button ref={inputRef} onClick={() => { setCount(count + 1); setCount(c => c + 1); bump(); sync(); }} data-label={label}>{doubled}</button>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    assert!(code.contains("let count = $state(0);"), "{code}");
+    assert!(code.contains("count = count + 1"), "{code}");
+    assert!(code.contains("count = (c => c + 1)(count)"), "{code}");
+    assert!(
+        code.contains("let doubled = $derived(count * 2);"),
+        "{code}"
+    );
+    assert!(
+        code.contains("let label = $derived(first + ':' + count);"),
+        "{code}"
+    );
+    assert!(!code.contains("let label = $state"), "{code}");
+    assert!(
+        code.contains("const bump = () => count = (c => c + 1)(count);"),
+        "{code}"
+    );
+    assert!(
+        code.contains("label = (value => { count = count + 1; return value; })(label)"),
+        "{code}"
+    );
+    assert!(code.contains("onMount(() => {"), "{code}");
+    assert!(code.contains("let inputRef = null;"), "{code}");
+    assert!(code.contains("bind:this={inputRef}"), "{code}");
+    assert!(code.contains("$effect(() => {"), "{code}");
+    assert!(code.contains("console.log(count);"), "{code}");
 }

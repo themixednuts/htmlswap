@@ -12,7 +12,9 @@ use crate::plan::{
     ActionBinding, ActionPayload, RenderActionArgument, RenderActionHandlerEffect,
     RenderControlFlow, RenderControlFlowKind, RenderElement, RenderFormControlType,
     RenderHeadElement, RenderNode, RenderPlan, RenderPseudoElement, RenderRaw, RenderScriptKind,
-    RenderScriptReference, RenderSourceIntent, RenderSourceLogic, RenderStateBinding,
+    RenderScriptReference, RenderSourceCallback, RenderSourceDerived, RenderSourceEffect,
+    RenderSourceIntent, RenderSourceLocal, RenderSourceLogic, RenderSourceLogicItem,
+    RenderSourceMount, RenderSourceRef, RenderSourceSnippet, RenderSourceState, RenderStateBinding,
     RenderStateKind, RenderStateOwner, RenderStyleCondition, RenderStyleVariant, RenderText,
     UiRole,
 };
@@ -268,6 +270,7 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         self.write_script(&mut output);
         self.write_head(&mut output, &plan.head);
         self.write_style(&mut output, plan);
+        self.write_jsx_snippets(&mut output, 0);
         for annotation in &plan.annotations {
             writeln!(
                 output,
@@ -305,6 +308,30 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
                     || logic.dialect.eq_ignore_ascii_case("jsx")
             })
             .cloned();
+        if let Some(logic) = self.prelude.source_logic.clone()
+            && logic.dialect.eq_ignore_ascii_case("jsx")
+        {
+            self.collect_jsx_source_logic(&logic);
+        }
+    }
+
+    fn collect_jsx_source_logic(&mut self, logic: &RenderSourceLogic) {
+        let Some(component) = &logic.component else {
+            return;
+        };
+        for item in &component.items {
+            if let RenderSourceLogicItem::Snippet(snippet) = item {
+                let mut scope = Scope::default();
+                for param in &snippet.params {
+                    for local in binding_pattern_locals(param) {
+                        scope = scope.with_local(local);
+                    }
+                }
+                for (index, node) in snippet.nodes.iter().enumerate() {
+                    self.collect_node(node, &scope, &format!("snippet_{}_{}", snippet.name, index));
+                }
+            }
+        }
     }
 
     fn collect_node(&mut self, node: &RenderNode, scope: &Scope, path: &str) {
@@ -690,9 +717,87 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
     fn write_jsx_source_logic(&self, output: &mut String, logic: &RenderSourceLogic) {
         self.write_jsx_props(output, logic);
         self.write_indented_source_logic_body(output, logic);
+        self.write_jsx_component_logic(output, logic);
         if !logic.body.trim().is_empty() {
             writeln!(output).expect("writing to String cannot fail");
         }
+    }
+
+    fn write_jsx_component_logic(&self, output: &mut String, logic: &RenderSourceLogic) {
+        let Some(component) = &logic.component else {
+            return;
+        };
+        if !logic.body.trim().is_empty() {
+            writeln!(output).expect("writing to String cannot fail");
+        }
+        for item in &component.items {
+            match item {
+                RenderSourceLogicItem::Local(local) => self.write_jsx_local(output, local),
+                RenderSourceLogicItem::State(state) => self.write_jsx_state(output, state),
+                RenderSourceLogicItem::Derived(derived) => self.write_jsx_derived(output, derived),
+                RenderSourceLogicItem::Ref(reference) => self.write_jsx_ref(output, reference),
+                RenderSourceLogicItem::Callback(callback) => {
+                    self.write_jsx_callback(output, callback)
+                }
+                RenderSourceLogicItem::Mount(mount) => self.write_jsx_mount(output, mount),
+                RenderSourceLogicItem::Effect(effect) => self.write_jsx_effect(output, effect),
+                RenderSourceLogicItem::Snippet(_) => {}
+            }
+        }
+    }
+
+    fn write_jsx_local(&self, output: &mut String, local: &RenderSourceLocal) {
+        write_indented_block(output, local.body.as_str(), 1);
+    }
+
+    fn write_jsx_state(&self, output: &mut String, state: &RenderSourceState) {
+        writeln!(output, "\tlet {} = $state({});", state.name, state.initial)
+            .expect("writing to String cannot fail");
+    }
+
+    fn write_jsx_derived(&self, output: &mut String, derived: &RenderSourceDerived) {
+        if derived.by {
+            writeln!(output, "\tlet {} = $derived.by(() => {{", derived.name)
+                .expect("writing to String cannot fail");
+            write_indented_block(output, derived.body.as_str(), 2);
+            writeln!(output, "\t}});").expect("writing to String cannot fail");
+        } else {
+            writeln!(
+                output,
+                "\tlet {} = $derived({});",
+                derived.name, derived.body
+            )
+            .expect("writing to String cannot fail");
+        }
+    }
+
+    fn write_jsx_ref(&self, output: &mut String, reference: &RenderSourceRef) {
+        if reference.dom && matches!(reference.initial.as_str(), "null" | "undefined") {
+            writeln!(output, "\tlet {};", reference.name).expect("writing to String cannot fail");
+        } else {
+            writeln!(output, "\tlet {} = {};", reference.name, reference.initial)
+                .expect("writing to String cannot fail");
+        }
+    }
+
+    fn write_jsx_callback(&self, output: &mut String, callback: &RenderSourceCallback) {
+        writeln!(output, "\tconst {} = {};", callback.name, callback.body)
+            .expect("writing to String cannot fail");
+    }
+
+    fn write_jsx_mount(&self, output: &mut String, mount: &RenderSourceMount) {
+        writeln!(output, "\tonMount(() => {{").expect("writing to String cannot fail");
+        write_indented_block(output, mount.body.as_str(), 2);
+        writeln!(output, "\t}});").expect("writing to String cannot fail");
+    }
+
+    fn write_jsx_effect(&self, output: &mut String, effect: &RenderSourceEffect) {
+        writeln!(output, "\t$effect(() => {{").expect("writing to String cannot fail");
+        for dependency in &effect.dependencies {
+            writeln!(output, "\t\t{dependency};").expect("writing to String cannot fail");
+        }
+        write_indented_block(output, effect.body.as_str(), 2);
+        writeln!(output, "\t}});").expect("writing to String cannot fail");
     }
 
     fn write_jsx_props(&self, output: &mut String, logic: &RenderSourceLogic) {
@@ -1085,6 +1190,54 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
         writeln!(output, "</style>").expect("writing to String cannot fail");
     }
+
+    fn write_jsx_snippets(&self, output: &mut String, depth: usize) {
+        let Some(logic) = &self.prelude.source_logic else {
+            return;
+        };
+        if !logic.dialect.eq_ignore_ascii_case("jsx") {
+            return;
+        }
+        let Some(component) = &logic.component else {
+            return;
+        };
+        for item in &component.items {
+            let RenderSourceLogicItem::Snippet(snippet) = item else {
+                continue;
+            };
+            self.write_jsx_snippet(output, snippet, depth);
+        }
+    }
+
+    fn write_jsx_snippet(&self, output: &mut String, snippet: &RenderSourceSnippet, depth: usize) {
+        let params = snippet
+            .params
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            output,
+            "{}{{#snippet {}({params})}}",
+            indent(depth),
+            snippet.name
+        )
+        .expect("writing to String cannot fail");
+        let mut scope = Scope::default();
+        for param in &snippet.params {
+            for local in binding_pattern_locals(param) {
+                scope = scope.with_local(local);
+            }
+        }
+        self.write_nodes(
+            output,
+            &snippet.nodes,
+            depth + 1,
+            &scope,
+            &format!("snippet_{}", snippet.name),
+        );
+        writeln!(output, "{}{{/snippet}}", indent(depth)).expect("writing to String cannot fail");
+    }
     fn write_nodes(
         &self,
         output: &mut String,
@@ -1364,6 +1517,13 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             self.write_nodes(output, &element.children, depth, scope, path);
             return;
         }
+        if element.source_tag == "jsx-render" {
+            if let Some(call) = attribute_value(element, "data-htmlswap-render") {
+                writeln!(output, "{}{{@render {call}}}", indent(depth))
+                    .expect("writing to String cannot fail");
+            }
+            return;
+        }
         if let Some(component) = jsx_component_placeholder_name(element) {
             self.write_jsx_component_placeholder(output, component, depth);
             return;
@@ -1510,6 +1670,16 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
                 }
                 if !attribute.value.is_empty() {
                     write!(output, " {{@attach {}}}", attribute.value)
+                        .expect("writing to String cannot fail");
+                }
+                continue;
+            }
+            if name == "bind:this" {
+                if !written_attributes.insert(attribute_key(name)) {
+                    continue;
+                }
+                if !attribute.value.is_empty() {
+                    write!(output, " bind:this={{{}}}", attribute.value)
                         .expect("writing to String cannot fail");
                 }
                 continue;
@@ -1954,6 +2124,13 @@ fn element_has_static_or_dynamic_style(element: &RenderElement) -> bool {
 }
 
 fn jsx_component_placeholder_name(element: &RenderElement) -> Option<&str> {
+    if element.source_tag == "jsx-component" {
+        return element
+            .source_intent
+            .as_deref()
+            .and_then(|intent| intent.component.as_ref())
+            .map(|component| component.as_str());
+    }
     element
         .attributes
         .iter()
@@ -2018,6 +2195,7 @@ fn should_skip_svelte_attribute(name: &str) -> bool {
                 | "data-htmlswap-slot"
                 | "data-htmlswap-state"
                 | "data-htmlswap-state-owner"
+                | "data-htmlswap-render"
         )
 }
 
@@ -2073,6 +2251,15 @@ fn element_has_attribute(element: &RenderElement, name: &str) -> bool {
         .iter()
         .any(|attribute| attribute.name.eq_ignore_ascii_case(name))
 }
+
+fn attribute_value<'a>(element: &'a RenderElement, name: &str) -> Option<&'a str> {
+    element
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name.eq_ignore_ascii_case(name))
+        .map(|attribute| attribute.value.as_str())
+}
+
 fn svelte_event_name(event: &str) -> String {
     let event = match event {
         "doubleclick" => "dblclick",
@@ -2614,8 +2801,26 @@ fn jsx_source_logic_declares(logic: &RenderSourceLogic, name: &str) -> bool {
     }
     let body = logic.body.as_str();
     jsx_source_logic_declared_names(body).contains(name)
+        || jsx_source_logic_component_declares(logic, name)
         || body.contains(&format!(", {name} ="))
         || body.contains(&format!(" {name} ="))
+}
+
+fn jsx_source_logic_component_declares(logic: &RenderSourceLogic, name: &str) -> bool {
+    let Some(component) = &logic.component else {
+        return false;
+    };
+    component.items.iter().any(|item| match item {
+        RenderSourceLogicItem::State(item) => item.name == name,
+        RenderSourceLogicItem::Derived(item) => item.name == name,
+        RenderSourceLogicItem::Ref(item) => item.name == name,
+        RenderSourceLogicItem::Callback(item) => item.name == name,
+        RenderSourceLogicItem::Snippet(item) => item.name == name,
+        RenderSourceLogicItem::Local(local) => {
+            jsx_source_logic_declared_names(local.body.as_str()).contains(name)
+        }
+        RenderSourceLogicItem::Mount(_) | RenderSourceLogicItem::Effect(_) => false,
+    })
 }
 
 fn jsx_source_logic_declared_names(body: &str) -> BTreeSet<String> {
@@ -2864,6 +3069,14 @@ fn char_at(body: &str, cursor: usize) -> Option<char> {
 }
 
 fn source_logic_uses_mount(logic: &RenderSourceLogic) -> bool {
+    if logic.dialect.eq_ignore_ascii_case("jsx") {
+        return logic.component.as_ref().is_some_and(|component| {
+            component
+                .items
+                .iter()
+                .any(|item| matches!(item, RenderSourceLogicItem::Mount(_)))
+        });
+    }
     if !logic.dialect.eq_ignore_ascii_case("dc") {
         return false;
     }

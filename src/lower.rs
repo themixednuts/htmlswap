@@ -1690,6 +1690,7 @@ fn source_logic_for_element(element: &HtmlElement) -> Option<RenderSourceLogic> 
         script_type: html_attribute_value(element, "type").map(CompactString::from),
         body: body.into(),
         data_props: html_attribute_value(element, "data-props").map(CompactString::from),
+        component: None,
         span: element.span,
     })
 }

@@ -1,6 +1,6 @@
 use htmlswap::{
     CompileAssets, Compiler, CompilerOptions, Expr, RenderControlFlowKind, RenderElement,
-    RenderNode, SourceFrontendKind, SourceKind,
+    RenderNode, RenderSourceLogicItem, SourceFrontendKind, SourceKind,
 };
 
 fn compile_jsx(source: &str) -> htmlswap::CompiledFragment {
@@ -105,8 +105,18 @@ fn discovers_exported_function_components_without_leaking_export_syntax() {
         "function Demo() { const label = 'identifier'; return <p>{label}</p>; } export default Demo;",
     ] {
         let compiled = compile_jsx(source);
-        let script = compiled.plan.source_logic[0].body.as_str();
-        assert!(script.contains("const label"));
+        let logic = &compiled.plan.source_logic[0];
+        let script = logic.body.as_str();
+        let local_body_has_label = logic.component.as_ref().is_some_and(|component| {
+            component.items.iter().any(|item| {
+                matches!(
+                    item,
+                    RenderSourceLogicItem::Local(local)
+                        if local.body.as_str().contains("const label")
+                )
+            })
+        });
+        assert!(script.contains("const label") || local_body_has_label);
         assert!(!script.contains("export"));
         assert!(
             matches!(&compiled.plan.nodes[0], RenderNode::Element(element) if element.source_tag == "p")
