@@ -39,6 +39,18 @@ fn emit_svelte_with_assets(source: &str, frontend: Frontend, assets: CompileAsse
     code
 }
 
+fn output_line_containing<'a>(code: &'a str, needle: &str) -> &'a str {
+    code.lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("expected output to contain `{needle}`:\n{code}"))
+}
+
+fn style_rule_count(code: &str, selector: &str) -> usize {
+    code.lines()
+        .filter(|line| line.trim_start().starts_with(selector))
+        .count()
+}
+
 #[test]
 fn svelte_adapter_emits_svelte5_event_attributes() {
     let code = emit_svelte(
@@ -113,10 +125,8 @@ fn svelte_adapter_emits_dc_template_class_bindings() {
         r#"<x-dc><button class="{{ key.className }}">Pure</button></x-dc>"#,
         Frontend::dc(),
     );
-    assert!(
-        pure.contains("<button class={key.className}>Pure</button>"),
-        "{pure}"
-    );
+    assert!(pure.contains("class={key.className}"), "{pure}");
+    assert_eq!(pure.matches(" class=").count(), 1, "{pure}");
     assert!(!pure.contains("{{"), "{pure}");
 
     let mixed = emit_svelte(
@@ -124,9 +134,10 @@ fn svelte_adapter_emits_dc_template_class_bindings() {
         Frontend::dc(),
     );
     assert!(
-        mixed.contains(r#"<button class={`keycap ${key.className}`}>Mixed</button>"#),
+        mixed.contains(r#"class={`keycap ${key.className}`}"#),
         "{mixed}"
     );
+    assert_eq!(mixed.matches(" class=").count(), 1, "{mixed}");
     assert!(!mixed.contains("{{"), "{mixed}");
 }
 
@@ -372,5 +383,217 @@ fn svelte_adapter_does_not_duplicate_external_hover_pseudo_selectors() {
     );
 
     assert!(!code.contains(":hover:hover"), "{code}");
-    assert!(code.contains(r#".hs_0.seg [role="tab"]:hover"#), "{code}");
+    assert_eq!(
+        style_rule_count(&code, r#".seg [role="tab"]:hover"#),
+        1,
+        "{code}"
+    );
+    assert!(!code.contains(r#".hs_0.seg [role="tab"]:hover"#), "{code}");
+}
+
+#[test]
+fn svelte_adapter_scopes_external_descendant_variant_by_original_selector() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        r#".seg [role="tab"]:hover { color: red; }"#,
+    );
+    let code = emit_svelte_with_assets(
+        r#"<div class="seg"><button role="tab">T</button></div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert_eq!(
+        style_rule_count(&code, r#".seg [role="tab"]:hover"#),
+        1,
+        "{code}"
+    );
+    assert!(!code.contains(r#".hs_0.seg [role="tab"]:hover"#), "{code}");
+    let button = output_line_containing(&code, r#"role="tab""#);
+    assert!(!button.contains("hs_"), "{code}");
+}
+
+#[test]
+fn svelte_adapter_scopes_external_tag_led_pseudo_element_by_original_selector() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        r#"input[type="range"]::-webkit-slider-thumb { width: 10px; }"#,
+    );
+    let code = emit_svelte_with_assets(r#"<input type="range">"#, Frontend::html(), assets);
+
+    assert_eq!(
+        style_rule_count(&code, r#"input[type="range"]::-webkit-slider-thumb"#),
+        1,
+        "{code}"
+    );
+    assert!(
+        !code.contains(r#".hs_0 input[type="range"]::-webkit-slider-thumb"#),
+        "{code}"
+    );
+    let input = output_line_containing(&code, "<input");
+    assert!(!input.contains("hs_"), "{code}");
+}
+
+#[test]
+fn svelte_adapter_scopes_external_simple_class_variant_by_original_selector() {
+    let assets = CompileAssets::new()
+        .with_stylesheet(Some("app.css".to_owned()), ".keycap:hover { color: red; }");
+    let code = emit_svelte_with_assets(r#"<div class="keycap">K</div>"#, Frontend::html(), assets);
+
+    assert_eq!(style_rule_count(&code, ".keycap:hover"), 1, "{code}");
+    let element = output_line_containing(&code, r#"class="keycap""#);
+    assert!(!element.contains("hs_"), "{code}");
+}
+
+#[test]
+fn svelte_adapter_dedupes_external_complex_variant_rules_across_elements() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        r#".seg [role="tab"]:hover { color: red; }"#,
+    );
+    let code = emit_svelte_with_assets(
+        r#"<div class="seg"><button role="tab">One</button><button role="tab">Two</button></div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert_eq!(
+        style_rule_count(&code, r#".seg [role="tab"]:hover"#),
+        1,
+        "{code}"
+    );
+    assert!(!code.contains(r#".hs_0.seg [role="tab"]:hover"#), "{code}");
+    assert!(!code.contains(r#".hs_1.seg [role="tab"]:hover"#), "{code}");
+}
+
+#[test]
+fn svelte_adapter_emits_external_base_rule_once_and_keeps_author_inline_style() {
+    let assets =
+        CompileAssets::new().with_stylesheet(Some("app.css".to_owned()), ".card { color: red; }");
+    let code = emit_svelte_with_assets(
+        r#"<div class="card" style="gap: 12px">Hi</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert!(code.contains("<style>"), "{code}");
+    assert!(code.contains(".card {"), "{code}");
+    assert!(code.contains("color: red;"), "{code}");
+    let element = output_line_containing(&code, r#"<div class="card""#);
+    assert!(element.contains(r#"style="gap: 12px""#), "{code}");
+    assert!(!element.contains("color: red"), "{code}");
+}
+
+#[test]
+fn svelte_adapter_keeps_author_override_inline_for_normal_stylesheet_rule() {
+    let assets =
+        CompileAssets::new().with_stylesheet(Some("app.css".to_owned()), ".card { color: red; }");
+    let code = emit_svelte_with_assets(
+        r#"<div class="card" style="color: blue">Hi</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert!(code.contains(".card {"), "{code}");
+    assert!(code.contains("color: red;"), "{code}");
+    let element = output_line_containing(&code, r#"<div class="card""#);
+    assert!(
+        element.contains(r#"style="color: #00f""#) || element.contains(r#"style="color: blue""#),
+        "{code}"
+    );
+}
+
+#[test]
+fn svelte_adapter_preserves_browser_cascade_for_stylesheet_important_override() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        ".card { color: red !important; }",
+    );
+    let code = emit_svelte_with_assets(
+        r#"<div class="card" style="color: blue">Hi</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert!(code.contains(".card {"), "{code}");
+    assert!(code.contains("color: red !important;"), "{code}");
+    let element = output_line_containing(&code, r#"<div class="card""#);
+    assert!(
+        element.contains(r#"style="color: #00f""#) || element.contains(r#"style="color: blue""#),
+        "{code}"
+    );
+}
+
+#[test]
+fn svelte_adapter_dedupes_external_base_rules_across_elements() {
+    let assets =
+        CompileAssets::new().with_stylesheet(Some("app.css".to_owned()), ".card { color: red; }");
+    let code = emit_svelte_with_assets(
+        r#"<div class="card">One</div><div class="card">Two</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert_eq!(code.matches(".card {").count(), 1, "{code}");
+    assert_eq!(code.matches(r#"class="card""#).count(), 2, "{code}");
+}
+
+#[test]
+fn svelte_adapter_preserves_non_stylesheet_inline_declarations() {
+    let assets =
+        CompileAssets::new().with_stylesheet(Some("app.css".to_owned()), ".card { color: red; }");
+    let code = emit_svelte_with_assets(
+        r#"<div class="card" style="box-sizing: border-box">Hi</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert!(code.contains(".card {"), "{code}");
+    let element = output_line_containing(&code, r#"<div class="card""#);
+    assert!(
+        element.contains(r#"style="box-sizing: border-box""#),
+        "{code}"
+    );
+    assert!(!element.contains("color: red"), "{code}");
+}
+
+#[test]
+fn svelte_adapter_diagnoses_browser_only_styles_from_external_stylesheet() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        ".overlay { position: fixed; z-index: 10; }",
+    );
+    let (code, cx) = adapt_svelte(
+        r#"<div class="overlay">Modal</div>"#,
+        Frontend::html(),
+        assets,
+    );
+
+    assert!(code.contains(".overlay {"), "{code}");
+    assert!(code.contains("position: fixed;"), "{code}");
+    assert!(code.contains("z-index: 10;"), "{code}");
+    let element = output_line_containing(&code, r#"<div class="overlay""#);
+    assert!(!element.contains("position: fixed"), "{code}");
+    assert!(!element.contains("z-index: 10"), "{code}");
+    let diagnostics = cx.diagnostics();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("position: fixed")
+                && diagnostic
+                    .message
+                    .contains("flexbox-only authoring contract")
+        }),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Warning
+                && diagnostic.message.contains("z-index: 10")
+                && diagnostic
+                    .message
+                    .contains("flexbox-only authoring contract")
+        }),
+        "{diagnostics:?}"
+    );
 }

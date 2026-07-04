@@ -289,11 +289,11 @@ impl<'a> JsxLowerer<'a> {
 
     fn lower_jsx_element(&mut self, element: &JSXElement<'a>) -> (RenderNode, Option<Expr>) {
         let tag = self.jsx_element_name(&element.opening_element.name);
-        if tag.chars().next().is_some_and(char::is_uppercase) {
-            self.diagnostics.push(Diagnostic::error(
-                format!("JSX component tag `{tag}` is outside Phase 0 scope"),
-                Some(self.span(element.opening_element.span)),
-            ));
+        if is_jsx_component_tag(&tag) {
+            return (self.lower_component_placeholder(&tag, element), None);
+        }
+        if tag == "style" {
+            return (self.lower_style_element(element), None);
         }
 
         let mut render = self.empty_element(&tag, element.span);
@@ -307,7 +307,7 @@ impl<'a> JsxLowerer<'a> {
                 }
                 JSXAttributeItem::SpreadAttribute(spread) => {
                     self.diagnostics.push(Diagnostic::error(
-                        "JSX spread attributes are outside Phase 0 scope",
+                        "JSX spread attributes are outside Phase 1 scope",
                         Some(self.span(spread.span)),
                     ));
                 }
@@ -315,6 +315,104 @@ impl<'a> JsxLowerer<'a> {
         }
         render.children = self.lower_children(&element.children);
         (RenderNode::Element(Box::new(render)), key)
+    }
+
+    fn lower_component_placeholder(&mut self, tag: &str, element: &JSXElement<'a>) -> RenderNode {
+        self.diagnostics.push(Diagnostic::warning(
+            format!("JSX component tag `{tag}` is outside Phase 1 scope; emitted placeholder"),
+            Some(self.span(element.opening_element.span)),
+        ));
+
+        let mut placeholder = self.empty_element("div", element.span);
+        placeholder
+            .classes
+            .push("htmlswap-jsx-component-placeholder".into());
+        placeholder.attributes.push(RenderAttribute {
+            name: "data-htmlswap-jsx-component-placeholder".into(),
+            value: tag.into(),
+            template: None,
+            span: Some(self.span(element.opening_element.span)),
+        });
+        placeholder.children.push(RenderNode::Text(RenderText {
+            value: format!("[unsupported JSX component: {tag}]"),
+            template: None,
+            span: Some(self.span(element.opening_element.span)),
+        }));
+        RenderNode::Element(Box::new(placeholder))
+    }
+
+    fn lower_style_element(&mut self, element: &JSXElement<'a>) -> RenderNode {
+        let mut render = self.empty_element("style", element.span);
+        for attribute in &element.opening_element.attributes {
+            match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    self.diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "JSX <style> attribute `{}` is outside Phase 1 scope",
+                            self.jsx_attribute_name(&attribute.name)
+                        ),
+                        Some(self.span(attribute.span)),
+                    ));
+                }
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        "JSX <style> spread attributes are outside Phase 1 scope",
+                        Some(self.span(spread.span)),
+                    ));
+                }
+            }
+        }
+        if let Some(css) = self.style_element_text(element) {
+            render.children.push(RenderNode::Text(RenderText {
+                value: css,
+                template: None,
+                span: Some(self.span(element.span)),
+            }));
+        }
+        RenderNode::Element(Box::new(render))
+    }
+
+    fn style_element_text(&mut self, element: &JSXElement<'a>) -> Option<String> {
+        let mut css = String::new();
+        for child in &element.children {
+            match child {
+                JSXChild::Text(text) => css.push_str(text.value.as_str()),
+                JSXChild::ExpressionContainer(container) => match &container.expression {
+                    JSXExpression::TemplateLiteral(template) => {
+                        if template.expressions.is_empty() {
+                            for quasi in &template.quasis {
+                                css.push_str(quasi.value.raw.as_str());
+                            }
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                "dynamic JSX <style> template expressions are outside Phase 1 scope",
+                                Some(self.span(container.span)),
+                            ));
+                        }
+                    }
+                    JSXExpression::StringLiteral(value) => css.push_str(value.value.as_str()),
+                    JSXExpression::EmptyExpression(_) => {}
+                    _ => self.diagnostics.push(Diagnostic::error(
+                        "JSX <style> children must be static text or a static template literal in Phase 1",
+                        Some(self.span(container.span)),
+                    )),
+                },
+                JSXChild::Element(child) => self.diagnostics.push(Diagnostic::error(
+                    "JSX elements inside <style> are outside Phase 1 scope",
+                    Some(self.span(child.span)),
+                )),
+                JSXChild::Fragment(fragment) => self.diagnostics.push(Diagnostic::error(
+                    "JSX fragments inside <style> are outside Phase 1 scope",
+                    Some(self.span(fragment.span)),
+                )),
+                JSXChild::Spread(spread) => self.diagnostics.push(Diagnostic::error(
+                    "JSX spread children inside <style> are outside Phase 1 scope",
+                    Some(self.span(spread.span)),
+                )),
+            }
+        }
+        let css = css.trim();
+        (!css.is_empty()).then(|| css.to_owned())
     }
 
     fn lower_attribute(
@@ -459,11 +557,7 @@ impl<'a> JsxLowerer<'a> {
                     .push(StyleDeclaration::new(css_name.as_str(), value, false, span));
             } else {
                 let expr = self.lower_expression(&property.value);
-                let suffix = if react_style_is_unitless(&css_name) {
-                    ""
-                } else {
-                    "px"
-                };
+                let suffix = dynamic_style_unit_suffix(&css_name, &property.value);
                 element.dynamic_styles.push(RenderDynamicStyleBinding {
                     state: None,
                     expression: TemplateString::new(
@@ -489,7 +583,7 @@ impl<'a> JsxLowerer<'a> {
                     .raw
                     .as_ref()
                     .map_or_else(|| value.value.to_string(), ToString::to_string);
-                if react_style_is_unitless(property) {
+                if property.starts_with("--") || react_style_is_unitless(property) {
                     Some(raw)
                 } else {
                     Some(format!("{raw}px"))
@@ -587,8 +681,11 @@ impl<'a> JsxLowerer<'a> {
             ));
             return None;
         };
-        let Some(binding) =
-            callback_binding(callback.params.items.first().map(|param| &param.pattern))
+        let Some(binding) = callback
+            .params
+            .items
+            .first()
+            .and_then(|param| self.callback_binding(&param.pattern))
         else {
             self.diagnostics.push(Diagnostic::error(
                 "JSX .map(...) callback must bind an item parameter in Phase 0",
@@ -600,7 +697,7 @@ impl<'a> JsxLowerer<'a> {
             .params
             .items
             .get(1)
-            .and_then(|param| callback_binding(Some(&param.pattern)));
+            .and_then(|param| self.callback_binding(&param.pattern));
         let list_expr = self.lower_expression(&member.object);
         let locals = self.callback_locals(callback);
         let Some(return_expression) = returned_expression(&callback.body) else {
@@ -675,6 +772,21 @@ impl<'a> JsxLowerer<'a> {
             }
         }
         locals
+    }
+
+    fn callback_binding(&self, pattern: &OxcBindingPattern<'a>) -> Option<BindingPattern> {
+        match pattern {
+            OxcBindingPattern::BindingIdentifier(identifier) => Some(BindingPattern::new(
+                identifier.name.as_str(),
+                Some(self.span(pattern.span())),
+            )),
+            OxcBindingPattern::ArrayPattern(_) | OxcBindingPattern::ObjectPattern(_) => {
+                let source = self.source_for_span(pattern.span()).trim();
+                (!source.is_empty())
+                    .then(|| BindingPattern::new(source, Some(self.span(pattern.span()))))
+            }
+            OxcBindingPattern::AssignmentPattern(pattern) => self.callback_binding(&pattern.left),
+        }
     }
 
     fn attribute_expr(&mut self, value: &JSXAttributeValue<'a>) -> Option<Expr> {
@@ -975,12 +1087,6 @@ fn argument_arrow_function<'b, 'a>(
     }
 }
 
-fn callback_binding(pattern: Option<&OxcBindingPattern<'_>>) -> Option<BindingPattern> {
-    let pattern = pattern?;
-    let name = binding_identifier_name(pattern)?;
-    Some(BindingPattern::new(name, None))
-}
-
 fn binding_identifier_name(pattern: &OxcBindingPattern<'_>) -> Option<CompactString> {
     match pattern {
         OxcBindingPattern::BindingIdentifier(identifier) => Some(identifier.name.as_str().into()),
@@ -1020,14 +1126,28 @@ fn flush_text(
 
 fn normalize_jsx_text(value: &str) -> Option<String> {
     if !value.contains('\n') {
-        return (!value.trim().is_empty()).then(|| value.to_owned());
+        return (!value.is_empty()).then(|| value.replace(['\t', '\r'], " "));
     }
-    let normalized = value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
+
+    let lines = value.lines().collect::<Vec<_>>();
+    let last = lines.len().saturating_sub(1);
+    let mut normalized = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        let mut line = line.replace(['\t', '\r'], " ");
+        if index > 0 {
+            line = line.trim_start().to_owned();
+        }
+        if index < last {
+            line = line.trim_end().to_owned();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        normalized.push_str(&line);
+        if index < last {
+            normalized.push(' ');
+        }
+    }
     (!normalized.is_empty()).then_some(normalized)
 }
 
@@ -1038,17 +1158,225 @@ fn react_attribute_name(name: &str) -> CompactString {
         "defaultValue" => "value".into(),
         "defaultChecked" => "checked".into(),
         _ if name.starts_with("aria-") || name.starts_with("data-") => name.into(),
+        _ if let Some(mapped) = react_attribute_alias(name) => mapped.into(),
         _ if name.chars().any(char::is_uppercase) => camel_to_kebab(name).into(),
         _ => name.into(),
     }
 }
 
+fn react_attribute_alias(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "acceptCharset" => "accept-charset",
+        "accessKey" => "accesskey",
+        "allowFullScreen" => "allowfullscreen",
+        "autoCapitalize" => "autocapitalize",
+        "autoComplete" => "autocomplete",
+        "autoCorrect" => "autocorrect",
+        "autoFocus" => "autofocus",
+        "autoPlay" => "autoplay",
+        "cellPadding" => "cellpadding",
+        "cellSpacing" => "cellspacing",
+        "charSet" => "charset",
+        "classID" => "classid",
+        "colSpan" => "colspan",
+        "contentEditable" => "contenteditable",
+        "contextMenu" => "contextmenu",
+        "controlsList" => "controlslist",
+        "crossOrigin" => "crossorigin",
+        "dateTime" => "datetime",
+        "encType" => "enctype",
+        "enterKeyHint" => "enterkeyhint",
+        "formAction" => "formaction",
+        "formEncType" => "formenctype",
+        "formMethod" => "formmethod",
+        "formNoValidate" => "formnovalidate",
+        "formTarget" => "formtarget",
+        "frameBorder" => "frameborder",
+        "hrefLang" => "hreflang",
+        "httpEquiv" => "http-equiv",
+        "inputMode" => "inputmode",
+        "keyParams" => "keyparams",
+        "keyType" => "keytype",
+        "marginHeight" => "marginheight",
+        "marginWidth" => "marginwidth",
+        "maxLength" => "maxlength",
+        "mediaGroup" => "mediagroup",
+        "minLength" => "minlength",
+        "noModule" => "nomodule",
+        "noValidate" => "novalidate",
+        "radioGroup" => "radiogroup",
+        "readOnly" => "readonly",
+        "referrerPolicy" => "referrerpolicy",
+        "rowSpan" => "rowspan",
+        "spellCheck" => "spellcheck",
+        "srcDoc" => "srcdoc",
+        "srcLang" => "srclang",
+        "srcSet" => "srcset",
+        "tabIndex" => "tabindex",
+        "useMap" => "usemap",
+        "accentHeight" => "accent-height",
+        "alignmentBaseline" => "alignment-baseline",
+        "arabicForm" => "arabic-form",
+        "attributeName" => "attributeName",
+        "attributeType" => "attributeType",
+        "baseFrequency" => "baseFrequency",
+        "baselineShift" => "baseline-shift",
+        "baseProfile" => "baseProfile",
+        "calcMode" => "calcMode",
+        "capHeight" => "cap-height",
+        "clipPath" => "clip-path",
+        "clipPathUnits" => "clipPathUnits",
+        "clipRule" => "clip-rule",
+        "colorInterpolation" => "color-interpolation",
+        "colorInterpolationFilters" => "color-interpolation-filters",
+        "colorProfile" => "color-profile",
+        "colorRendering" => "color-rendering",
+        "contentScriptType" => "contentScriptType",
+        "contentStyleType" => "contentStyleType",
+        "diffuseConstant" => "diffuseConstant",
+        "dominantBaseline" => "dominant-baseline",
+        "edgeMode" => "edgeMode",
+        "enableBackground" => "enable-background",
+        "externalResourcesRequired" => "externalResourcesRequired",
+        "fillOpacity" => "fill-opacity",
+        "fillRule" => "fill-rule",
+        "filterRes" => "filterRes",
+        "filterUnits" => "filterUnits",
+        "floodColor" => "flood-color",
+        "floodOpacity" => "flood-opacity",
+        "fontFamily" => "font-family",
+        "fontSize" => "font-size",
+        "fontSizeAdjust" => "font-size-adjust",
+        "fontStretch" => "font-stretch",
+        "fontStyle" => "font-style",
+        "fontVariant" => "font-variant",
+        "fontWeight" => "font-weight",
+        "glyphName" => "glyph-name",
+        "glyphOrientationHorizontal" => "glyph-orientation-horizontal",
+        "glyphOrientationVertical" => "glyph-orientation-vertical",
+        "glyphRef" => "glyphRef",
+        "gradientTransform" => "gradientTransform",
+        "gradientUnits" => "gradientUnits",
+        "horizAdvX" => "horiz-adv-x",
+        "horizOriginX" => "horiz-origin-x",
+        "imageRendering" => "image-rendering",
+        "kernelMatrix" => "kernelMatrix",
+        "kernelUnitLength" => "kernelUnitLength",
+        "keyPoints" => "keyPoints",
+        "keySplines" => "keySplines",
+        "keyTimes" => "keyTimes",
+        "lengthAdjust" => "lengthAdjust",
+        "letterSpacing" => "letter-spacing",
+        "lightingColor" => "lighting-color",
+        "limitingConeAngle" => "limitingConeAngle",
+        "markerEnd" => "marker-end",
+        "markerHeight" => "markerHeight",
+        "markerMid" => "marker-mid",
+        "markerStart" => "marker-start",
+        "markerUnits" => "markerUnits",
+        "markerWidth" => "markerWidth",
+        "maskContentUnits" => "maskContentUnits",
+        "maskUnits" => "maskUnits",
+        "numOctaves" => "numOctaves",
+        "overlinePosition" => "overline-position",
+        "overlineThickness" => "overline-thickness",
+        "paintOrder" => "paint-order",
+        "panose1" => "panose-1",
+        "pathLength" => "pathLength",
+        "patternContentUnits" => "patternContentUnits",
+        "patternTransform" => "patternTransform",
+        "patternUnits" => "patternUnits",
+        "pointerEvents" => "pointer-events",
+        "pointsAtX" => "pointsAtX",
+        "pointsAtY" => "pointsAtY",
+        "pointsAtZ" => "pointsAtZ",
+        "preserveAlpha" => "preserveAlpha",
+        "preserveAspectRatio" => "preserveAspectRatio",
+        "primitiveUnits" => "primitiveUnits",
+        "refX" => "refX",
+        "refY" => "refY",
+        "renderingIntent" => "rendering-intent",
+        "repeatCount" => "repeatCount",
+        "repeatDur" => "repeatDur",
+        "requiredExtensions" => "requiredExtensions",
+        "requiredFeatures" => "requiredFeatures",
+        "specularConstant" => "specularConstant",
+        "specularExponent" => "specularExponent",
+        "spreadMethod" => "spreadMethod",
+        "startOffset" => "startOffset",
+        "stdDeviation" => "stdDeviation",
+        "stitchTiles" => "stitchTiles",
+        "stopColor" => "stop-color",
+        "stopOpacity" => "stop-opacity",
+        "strikethroughPosition" => "strikethrough-position",
+        "strikethroughThickness" => "strikethrough-thickness",
+        "strokeDasharray" => "stroke-dasharray",
+        "strokeDashoffset" => "stroke-dashoffset",
+        "strokeLinecap" => "stroke-linecap",
+        "strokeLinejoin" => "stroke-linejoin",
+        "strokeMiterlimit" => "stroke-miterlimit",
+        "strokeOpacity" => "stroke-opacity",
+        "strokeWidth" => "stroke-width",
+        "surfaceScale" => "surfaceScale",
+        "systemLanguage" => "systemLanguage",
+        "tableValues" => "tableValues",
+        "targetX" => "targetX",
+        "targetY" => "targetY",
+        "textAnchor" => "text-anchor",
+        "textDecoration" => "text-decoration",
+        "textLength" => "textLength",
+        "textRendering" => "text-rendering",
+        "underlinePosition" => "underline-position",
+        "underlineThickness" => "underline-thickness",
+        "unicodeBidi" => "unicode-bidi",
+        "unicodeRange" => "unicode-range",
+        "unitsPerEm" => "units-per-em",
+        "vAlphabetic" => "v-alphabetic",
+        "vHanging" => "v-hanging",
+        "vIdeographic" => "v-ideographic",
+        "vMathematical" => "v-mathematical",
+        "vectorEffect" => "vector-effect",
+        "vertAdvY" => "vert-adv-y",
+        "vertOriginX" => "vert-origin-x",
+        "vertOriginY" => "vert-origin-y",
+        "viewBox" => "viewBox",
+        "viewTarget" => "viewTarget",
+        "wordSpacing" => "word-spacing",
+        "writingMode" => "writing-mode",
+        "xChannelSelector" => "xChannelSelector",
+        "xHeight" => "x-height",
+        "xlinkActuate" => "xlink:actuate",
+        "xlinkArcrole" => "xlink:arcrole",
+        "xlinkHref" => "xlink:href",
+        "xlinkRole" => "xlink:role",
+        "xlinkShow" => "xlink:show",
+        "xlinkTitle" => "xlink:title",
+        "xlinkType" => "xlink:type",
+        "xmlBase" => "xml:base",
+        "xmlLang" => "xml:lang",
+        "xmlSpace" => "xml:space",
+        "xmlnsXlink" => "xmlns:xlink",
+        "yChannelSelector" => "yChannelSelector",
+        "zoomAndPan" => "zoomAndPan",
+        _ => return None,
+    })
+}
+
 fn css_property_name(name: &str) -> String {
     if name.starts_with("--") {
         name.to_owned()
+    } else if is_vendor_prefixed_style_name(name) {
+        format!("-{}", camel_to_kebab(name))
     } else {
         camel_to_kebab(name)
     }
+}
+
+fn is_vendor_prefixed_style_name(name: &str) -> bool {
+    (name.starts_with("ms") && name.chars().nth(2).is_some_and(|ch| ch.is_uppercase()))
+        || ["Moz", "O", "Webkit"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
 }
 
 fn camel_to_kebab(name: &str) -> String {
@@ -1070,6 +1398,7 @@ fn react_style_is_unitless(property: &str) -> bool {
     matches!(
         property,
         "animation-iteration-count"
+            | "aspect-ratio"
             | "border-image-outset"
             | "border-image-slice"
             | "border-image-width"
@@ -1078,7 +1407,9 @@ fn react_style_is_unitless(property: &str) -> bool {
             | "box-ordinal-group"
             | "column-count"
             | "columns"
+            | "fill-opacity"
             | "flex"
+            | "flex-basis"
             | "flex-grow"
             | "flex-positive"
             | "flex-shrink"
@@ -1099,11 +1430,179 @@ fn react_style_is_unitless(property: &str) -> bool {
             | "opacity"
             | "order"
             | "orphans"
+            | "scale"
+            | "stroke-opacity"
             | "tab-size"
             | "widows"
             | "z-index"
             | "zoom"
     )
+}
+
+fn dynamic_style_unit_suffix(property: &str, expression: &Expression<'_>) -> &'static str {
+    if property.starts_with("--")
+        || react_style_is_unitless(property)
+        || !style_property_allows_px(property)
+        || expression_is_stringish(expression)
+    {
+        return "";
+    }
+    if expression_can_be_numeric(expression) {
+        "px"
+    } else {
+        ""
+    }
+}
+
+fn style_property_allows_px(property: &str) -> bool {
+    matches!(
+        property,
+        "block-size"
+            | "border-block-end-width"
+            | "border-block-start-width"
+            | "border-bottom-left-radius"
+            | "border-bottom-right-radius"
+            | "border-bottom-width"
+            | "border-end-end-radius"
+            | "border-end-start-radius"
+            | "border-inline-end-width"
+            | "border-inline-start-width"
+            | "border-left-width"
+            | "border-radius"
+            | "border-right-width"
+            | "border-spacing"
+            | "border-start-end-radius"
+            | "border-start-start-radius"
+            | "border-top-left-radius"
+            | "border-top-right-radius"
+            | "border-top-width"
+            | "border-width"
+            | "bottom"
+            | "column-gap"
+            | "column-rule-width"
+            | "flex-basis"
+            | "font-size"
+            | "gap"
+            | "height"
+            | "inline-size"
+            | "inset"
+            | "inset-block"
+            | "inset-block-end"
+            | "inset-block-start"
+            | "inset-inline"
+            | "inset-inline-end"
+            | "inset-inline-start"
+            | "left"
+            | "letter-spacing"
+            | "margin"
+            | "margin-block"
+            | "margin-block-end"
+            | "margin-block-start"
+            | "margin-bottom"
+            | "margin-inline"
+            | "margin-inline-end"
+            | "margin-inline-start"
+            | "margin-left"
+            | "margin-right"
+            | "margin-top"
+            | "max-block-size"
+            | "max-height"
+            | "max-inline-size"
+            | "max-width"
+            | "min-block-size"
+            | "min-height"
+            | "min-inline-size"
+            | "min-width"
+            | "outline-offset"
+            | "outline-width"
+            | "padding"
+            | "padding-block"
+            | "padding-block-end"
+            | "padding-block-start"
+            | "padding-bottom"
+            | "padding-inline"
+            | "padding-inline-end"
+            | "padding-inline-start"
+            | "padding-left"
+            | "padding-right"
+            | "padding-top"
+            | "perspective"
+            | "right"
+            | "row-gap"
+            | "scroll-margin"
+            | "scroll-margin-block"
+            | "scroll-margin-block-end"
+            | "scroll-margin-block-start"
+            | "scroll-margin-bottom"
+            | "scroll-margin-inline"
+            | "scroll-margin-inline-end"
+            | "scroll-margin-inline-start"
+            | "scroll-margin-left"
+            | "scroll-margin-right"
+            | "scroll-margin-top"
+            | "scroll-padding"
+            | "scroll-padding-block"
+            | "scroll-padding-block-end"
+            | "scroll-padding-block-start"
+            | "scroll-padding-bottom"
+            | "scroll-padding-inline"
+            | "scroll-padding-inline-end"
+            | "scroll-padding-inline-start"
+            | "scroll-padding-left"
+            | "scroll-padding-right"
+            | "scroll-padding-top"
+            | "text-indent"
+            | "text-underline-offset"
+            | "top"
+            | "width"
+            | "word-spacing"
+    )
+}
+
+fn expression_is_stringish(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => true,
+        Expression::ParenthesizedExpression(expression) => {
+            expression_is_stringish(&expression.expression)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            expression_is_stringish(&conditional.consequent)
+                || expression_is_stringish(&conditional.alternate)
+        }
+        Expression::LogicalExpression(logical) => {
+            expression_is_stringish(&logical.left) || expression_is_stringish(&logical.right)
+        }
+        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
+            expression_is_stringish(&binary.left) || expression_is_stringish(&binary.right)
+        }
+        _ => false,
+    }
+}
+
+fn expression_can_be_numeric(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::NumericLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_)
+        | Expression::CallExpression(_) => true,
+        Expression::ParenthesizedExpression(expression) => {
+            expression_can_be_numeric(&expression.expression)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            expression_can_be_numeric(&conditional.consequent)
+                && expression_can_be_numeric(&conditional.alternate)
+        }
+        Expression::BinaryExpression(binary) => {
+            !expression_is_stringish(expression)
+                && matches!(binary.operator.as_str(), "+" | "-" | "*" | "/" | "%" | "**")
+        }
+        _ => false,
+    }
+}
+
+fn is_jsx_component_tag(tag: &str) -> bool {
+    tag.contains('.') || tag.chars().next().is_some_and(char::is_uppercase)
 }
 
 fn role_for_tag(tag: &str) -> UiRole {

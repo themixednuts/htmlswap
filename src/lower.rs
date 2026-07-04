@@ -759,20 +759,21 @@ fn lower_element<'a>(
         }
     }
 
-    let (mut styles, style_variants, stylesheet_rules, stylesheet_winners) = context.styles.map_or_else(
-        || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-        |styles| {
-            let style_element = StyleElement::new(element, ancestors, siblings, sibling_index);
-            let element_styles = styles.styles_for_element(&style_element);
-            let stylesheet_winners = element_styles.declarations;
-            (
-                stylesheet_winners.clone(),
-                element_styles.variants,
-                element_styles.matched_rules,
-                stylesheet_winners,
-            )
-        },
-    );
+    let (mut styles, style_variants, stylesheet_rules, stylesheet_winners) =
+        context.styles.map_or_else(
+            || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            |styles| {
+                let style_element = StyleElement::new(element, ancestors, siblings, sibling_index);
+                let element_styles = styles.styles_for_element(&style_element);
+                let stylesheet_winners = element_styles.declarations;
+                (
+                    stylesheet_winners.clone(),
+                    element_styles.variants,
+                    element_styles.matched_rules,
+                    stylesheet_winners,
+                )
+            },
+        );
     let inline_properties = inline_styles
         .iter()
         .map(|style| style.property.clone())
@@ -974,7 +975,9 @@ fn merge_inline_styles(styles: &mut Vec<StyleDeclaration>, inline_styles: Vec<St
 }
 
 fn style_declarations_match(left: &StyleDeclaration, right: &StyleDeclaration) -> bool {
-    left.property == right.property && left.value == right.value && left.important == right.important
+    left.property == right.property
+        && left.value == right.value
+        && left.important == right.important
 }
 
 fn script_styles_for_dynamic_expression<'a>(

@@ -116,6 +116,33 @@ struct PropBinding {
     snippet: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StyleRuleOrderKey {
+    source: usize,
+    start: usize,
+    end: usize,
+    fallback: usize,
+}
+
+impl StyleRuleOrderKey {
+    fn new(span: Option<Span>, fallback: usize) -> Self {
+        span.map_or(
+            Self {
+                source: usize::MAX,
+                start: fallback,
+                end: usize::MAX,
+                fallback,
+            },
+            |span| Self {
+                source: span.source.index(),
+                start: span.start,
+                end: span.end,
+                fallback,
+            },
+        )
+    }
+}
+
 #[derive(Debug, Default)]
 struct SveltePrelude {
     props: BTreeMap<String, PropBinding>,
@@ -129,8 +156,9 @@ struct SveltePrelude {
     uses_attachment: bool,
     uses_style_helper: bool,
     style_classes: BTreeMap<String, String>,
-    stylesheet_rules: BTreeMap<usize, String>,
+    stylesheet_rules: BTreeMap<StyleRuleOrderKey, String>,
     style_rules: Vec<String>,
+    inline_style_blocks: Vec<String>,
 }
 
 impl SveltePrelude {
@@ -173,6 +201,30 @@ impl SveltePrelude {
                 default: None,
                 snippet: true,
             });
+    }
+
+    fn insert_stylesheet_rule_once(&mut self, key: StyleRuleOrderKey, rule_text: String) {
+        self.stylesheet_rules.entry(key).or_insert(rule_text);
+    }
+
+    fn insert_deduped_stylesheet_rule(&mut self, span: Option<Span>, rule_text: String) {
+        if self
+            .stylesheet_rules
+            .values()
+            .any(|existing| existing == &rule_text)
+        {
+            return;
+        }
+
+        let mut fallback = self.stylesheet_rules.len();
+        loop {
+            let key = StyleRuleOrderKey::new(span, fallback);
+            if !self.stylesheet_rules.contains_key(&key) {
+                self.stylesheet_rules.insert(key, rule_text);
+                break;
+            }
+            fallback += 1;
+        }
     }
 }
 
@@ -265,13 +317,19 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
     }
     fn collect_element(&mut self, element: &RenderElement, scope: &Scope, path: &str) {
+        if let Some(style_block) = inline_style_block(element) {
+            self.prelude.inline_style_blocks.push(style_block);
+            return;
+        }
         let scope =
             scope_for_control_flow(element.control_flow.as_deref(), scope, &mut self.prelude);
         self.collect_browser_only_style_diagnostics(element);
-        if element_emits_dom_node(element) {
+        let emits_dom_node = element_emits_dom_node(element);
+        if emits_dom_node {
             self.collect_stylesheet_rules(element);
+            self.collect_stylesheet_variant_rules(element);
         }
-        if element_needs_style_class(element) && element_emits_dom_node(element) {
+        if element_needs_style_class(element) && emits_dom_node {
             let class = format!("hs_{}", self.prelude.style_classes.len());
             self.prelude
                 .style_classes
@@ -403,32 +461,47 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
 
     fn collect_stylesheet_rules(&mut self, element: &RenderElement) {
         for rule in &element.stylesheet_rules {
-            if self
-                .prelude
-                .stylesheet_rules
-                .contains_key(&rule.source_order)
-            {
-                continue;
-            }
             if let Some(rule_text) = conditioned_style_rule(
                 rule.selector.to_string(),
                 &rule.conditions,
                 &rule.declarations,
             ) {
+                self.prelude.insert_stylesheet_rule_once(
+                    StyleRuleOrderKey::new(rule.span, rule.source_order),
+                    rule_text,
+                );
+            }
+        }
+    }
+
+    fn collect_stylesheet_variant_rules(&mut self, element: &RenderElement) {
+        for variant in &element.style_variants {
+            if let Some(rule) = stylesheet_variant_rule(variant) {
                 self.prelude
-                    .stylesheet_rules
-                    .insert(rule.source_order, rule_text);
+                    .insert_deduped_stylesheet_rule(variant.span, rule);
+            }
+        }
+        for pseudo in &element.pseudo_elements {
+            if let Some(rule) = stylesheet_pseudo_element_rule(pseudo) {
+                self.prelude
+                    .insert_deduped_stylesheet_rule(pseudo.span, rule);
             }
         }
     }
 
     fn collect_element_style_rules(&mut self, element: &RenderElement, class: &str) {
         for variant in &element.style_variants {
+            if !uses_generated_style_class(&variant.selector) {
+                continue;
+            }
             if let Some(rule) = style_variant_rule(&format!(".{class}"), variant) {
                 self.prelude.style_rules.push(rule);
             }
         }
         for pseudo in &element.pseudo_elements {
+            if !uses_generated_style_class(&pseudo.selector) {
+                continue;
+            }
             if let Some(rule) = pseudo_element_rule(&format!(".{class}"), pseudo) {
                 self.prelude.style_rules.push(rule);
             }
@@ -928,6 +1001,7 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         if !has_root
             && self.prelude.stylesheet_rules.is_empty()
             && self.prelude.style_rules.is_empty()
+            && self.prelude.inline_style_blocks.is_empty()
         {
             return;
         }
@@ -951,6 +1025,9 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
         for rule in &self.prelude.style_rules {
             write_indented_block(output, rule, 1);
+        }
+        for block in &self.prelude.inline_style_blocks {
+            write_indented_style_block(output, block, 1);
         }
         writeln!(output, "</style>").expect("writing to String cannot fail");
     }
@@ -1097,10 +1174,10 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             .as_ref()
             .map(svelte_expr)
             .unwrap_or_else(|| "[]".to_owned());
-        let binding = control_flow
+        let binding_pattern = control_flow
             .binding
             .as_ref()
-            .map(|binding| sanitize_js_identifier(&binding.name, "item"))
+            .map(|binding| svelte_binding_pattern(&binding.name))
             .unwrap_or_else(|| "item".to_owned());
         let index_binding = control_flow
             .index_binding
@@ -1112,11 +1189,11 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             .map(|key| format!(" ({})", svelte_expr(key)))
             .unwrap_or_default();
         let each_binding = if let Some(index_binding) = &index_binding {
-            format!("{binding}, {index_binding}")
+            format!("{binding_pattern}, {index_binding}")
         } else if control_flow.key.is_some() {
-            binding.clone()
+            binding_pattern.clone()
         } else {
-            format!("{binding}, $index")
+            format!("{binding_pattern}, $index")
         };
         writeln!(
             output,
@@ -1124,7 +1201,14 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             indent(depth)
         )
         .expect("writing to String cannot fail");
-        let mut inner_scope = scope.with_local(binding).with_local("$index");
+        let mut inner_scope = scope.with_local("$index");
+        if let Some(binding) = &control_flow.binding {
+            for local in binding_pattern_locals(&binding.name) {
+                inner_scope = inner_scope.with_local(local);
+            }
+        } else {
+            inner_scope = inner_scope.with_local("item");
+        }
         if let Some(index_binding) = index_binding {
             inner_scope = inner_scope.with_local(index_binding);
         }
@@ -1206,6 +1290,9 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
         if is_control_flow_wrapper(element) {
             self.write_nodes(output, &element.children, depth, scope, path);
+            return;
+        }
+        if inline_style_block(element).is_some() {
             return;
         }
         if element_is_render_slot(element) {
@@ -1555,7 +1642,6 @@ fn scope_for_control_flow(
         return scope.clone();
     }
     if let Some(binding) = &control_flow.binding {
-        let local = sanitize_js_identifier(&binding.name, "item");
         let index = control_flow
             .index_binding
             .as_ref()
@@ -1567,12 +1653,59 @@ fn scope_for_control_flow(
         {
             prelude.prop_with_default(root, "[]");
         }
-        return scope
-            .with_local(local)
-            .with_local(index)
-            .with_local("$index");
+        let mut scope = scope.with_local(index).with_local("$index");
+        for local in binding_pattern_locals(&binding.name) {
+            scope = scope.with_local(local);
+        }
+        return scope;
     }
     scope.clone()
+}
+
+fn svelte_binding_pattern(value: &str) -> String {
+    let value = value.trim();
+    if is_destructuring_binding_pattern(value) {
+        value.to_owned()
+    } else {
+        sanitize_js_identifier(value, "item")
+    }
+}
+
+fn binding_pattern_locals(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if !is_destructuring_binding_pattern(value) {
+        return vec![sanitize_js_identifier(value, "item")];
+    }
+
+    let mut locals = BTreeSet::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if current.is_empty() {
+            if is_identifier_start(ch) {
+                current.push(ch);
+            }
+        } else if is_identifier_continue(ch) {
+            current.push(ch);
+        } else {
+            push_binding_local(&mut locals, &current);
+            current.clear();
+        }
+    }
+    push_binding_local(&mut locals, &current);
+    locals.into_iter().collect()
+}
+
+fn push_binding_local(locals: &mut BTreeSet<String>, name: &str) {
+    if !name.is_empty()
+        && !JS_KEYWORDS.contains(&name)
+        && !matches!(name, "undefined" | "null" | "true" | "false")
+    {
+        locals.insert(name.to_owned());
+    }
+}
+
+fn is_destructuring_binding_pattern(value: &str) -> bool {
+    value.starts_with('[') || value.starts_with('{')
 }
 
 fn element_emits_dom_node(element: &RenderElement) -> bool {
@@ -1581,7 +1714,14 @@ fn element_emits_dom_node(element: &RenderElement) -> bool {
         && !should_emit_svelte_component(element)
 }
 fn element_needs_style_class(element: &RenderElement) -> bool {
-    !element.style_variants.is_empty() || !element.pseudo_elements.is_empty()
+    element
+        .style_variants
+        .iter()
+        .any(|variant| uses_generated_style_class(&variant.selector))
+        || element
+            .pseudo_elements
+            .iter()
+            .any(|pseudo| uses_generated_style_class(&pseudo.selector))
 }
 
 fn tag_for_element(element: &RenderElement) -> String {
@@ -1703,6 +1843,44 @@ fn element_has_static_or_dynamic_style(element: &RenderElement) -> bool {
         .iter()
         .any(|style| !is_stylesheet_declaration(element, style))
         || !element.dynamic_styles.is_empty()
+}
+
+fn inline_style_block(element: &RenderElement) -> Option<String> {
+    if element.source_tag != "style" {
+        return None;
+    }
+
+    let mut block = String::new();
+    for child in &element.children {
+        match child {
+            RenderNode::Text(text) => block.push_str(&text.value),
+            RenderNode::Raw(raw) => block.push_str(&raw.html),
+            RenderNode::Element(_) => return None,
+        }
+    }
+    let block = block.trim();
+    (!block.is_empty()).then(|| block.to_owned())
+}
+
+fn svelte_inline_styles(element: &RenderElement) -> Vec<&StyleDeclaration> {
+    element
+        .styles
+        .iter()
+        .filter(|style| !is_stylesheet_declaration(element, style))
+        .collect()
+}
+
+fn is_stylesheet_declaration(element: &RenderElement, declaration: &StyleDeclaration) -> bool {
+    element
+        .stylesheet_declarations
+        .iter()
+        .any(|stylesheet| style_declarations_match(stylesheet, declaration))
+}
+
+fn style_declarations_match(left: &StyleDeclaration, right: &StyleDeclaration) -> bool {
+    left.property == right.property
+        && left.value == right.value
+        && left.important == right.important
 }
 
 fn attribute_key(name: &str) -> String {
@@ -2116,9 +2294,9 @@ fn action_expression_roots(action: &ActionBinding) -> BTreeSet<String> {
     };
     loose_expression_roots(&expression)
 }
-fn format_styles(styles: &[StyleDeclaration]) -> String {
+fn format_styles<'a>(styles: impl IntoIterator<Item = &'a StyleDeclaration>) -> String {
     styles
-        .iter()
+        .into_iter()
         .map(|style| {
             let important = if style.important { " !important" } else { "" };
             format!(
@@ -2143,6 +2321,34 @@ fn browser_only_style_description(declaration: &StyleDeclaration) -> Option<Stri
     violates_contract.then(|| format!("{}: {value}", declaration.property.as_str()))
 }
 
+fn uses_generated_style_class(selector: &str) -> bool {
+    let selector = selector.trim();
+    selector.is_empty() || selector.starts_with("[style-")
+}
+
+fn stylesheet_variant_rule(variant: &RenderStyleVariant) -> Option<String> {
+    if uses_generated_style_class(&variant.selector) {
+        return None;
+    }
+    conditioned_style_rule(
+        variant.selector.to_string(),
+        &variant.conditions,
+        &variant.declarations,
+    )
+}
+
+fn stylesheet_pseudo_element_rule(pseudo: &RenderPseudoElement) -> Option<String> {
+    if uses_generated_style_class(&pseudo.selector) {
+        return None;
+    }
+    let declarations = pseudo_element_declarations(pseudo);
+    conditioned_style_rule(
+        pseudo.selector.to_string(),
+        &pseudo.conditions,
+        &declarations,
+    )
+}
+
 fn style_variant_rule(base_selector: &str, variant: &RenderStyleVariant) -> Option<String> {
     let selector = if variant.selector.is_empty() || variant.selector.starts_with("[style-") {
         base_selector.to_owned()
@@ -2158,6 +2364,11 @@ fn pseudo_element_rule(base_selector: &str, pseudo: &RenderPseudoElement) -> Opt
     } else {
         format!("{base_selector}{}", selector_suffix(&pseudo.selector))
     };
+    let declarations = pseudo_element_declarations(pseudo);
+    conditioned_style_rule(selector, &pseudo.conditions, &declarations)
+}
+
+fn pseudo_element_declarations(pseudo: &RenderPseudoElement) -> Vec<StyleDeclaration> {
     let mut declarations = pseudo.styles.clone();
     if !pseudo.children.is_empty()
         && !declarations
@@ -2166,7 +2377,7 @@ fn pseudo_element_rule(base_selector: &str, pseudo: &RenderPseudoElement) -> Opt
     {
         declarations.push(StyleDeclaration::new("content", "\"\"", false, pseudo.span));
     }
-    conditioned_style_rule(selector, &pseudo.conditions, &declarations)
+    declarations
 }
 
 fn selector_suffix(selector: &str) -> String {
@@ -2244,6 +2455,10 @@ fn write_indented_block(output: &mut String, block: &str, depth: usize) {
     for line in block.lines() {
         writeln!(output, "{}{}", indent(depth), line).expect("writing to String cannot fail");
     }
+}
+
+fn write_indented_style_block(output: &mut String, block: &str, depth: usize) {
+    write_indented_block(output, block.trim(), depth);
 }
 
 fn indent_block(block: &str, depth: usize) -> String {
@@ -2500,4 +2715,6 @@ const JS_KEYWORDS: &[&str] = &[
 ];
 
 const JS_GLOBALS: &[&str] = &[
-    "Array", "Boolean", "Date", "Error
+    "Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Promise", "String",
+    "console", "document", "window",
+];
