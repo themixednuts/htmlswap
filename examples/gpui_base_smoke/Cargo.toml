@@ -1,0 +1,12 @@
+[package]
+name = "htmlswap-gpui-base-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+[dependencies]
+gpui = "0.2.2"
+
+[build-dependencies]
+htmlswap = { path = "../.." }

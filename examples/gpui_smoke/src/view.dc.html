@@ -1,0 +1,118 @@
+<style>
+    :root {
+        --background: #101217;
+        --foreground: #eef2f8;
+        --primary: #5a8cff;
+        --border: #273142;
+    }
+
+    .shell {
+        width: 100vw;
+        height: 100vh;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        padding: 24px;
+        color: var(--foreground);
+        background: var(--background);
+    }
+
+    .titlebar {
+        height: 36px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: linear-gradient(135deg, var(--primary), #5ac0c0);
+    }
+
+    .brand {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .logo {
+        width: 14px;
+        height: 14px;
+        background: var(--primary);
+    }
+
+    .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+    }
+
+    .semantic-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .template-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+    }
+
+    .template-card {
+        border: 1px solid var(--border);
+        padding: 12px;
+        text-align: left;
+    }
+
+    .template-card:hover {
+        background: #202838;
+    }
+
+    .template-card:focus {
+        border: 1px solid var(--primary);
+    }
+
+    .fluid-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 8px;
+    }
+
+    .project-name:focus {
+        border: 1px solid var(--primary);
+    }
+</style>
+
+<section class="shell">
+    <!-- HTML comments must preserve through generated Rust comments. -->
+    <header class="titlebar">
+        <div class="brand"><span class="logo"></span><strong>Aether</strong><span>Project Manager</span></div>
+        <div class="window-controls">
+            <button aria-label="Minimize">remove</button>
+            <button aria-label="Maximize">crop_square</button>
+            <button aria-label="Close">close</button>
+        </div>
+    </header>
+
+    <div class="toolbar">
+        <input id="project-name" class="project-name" value="Aether" oninput="{{ save }}">
+        <button id="save" onclick="{{ save }}">Save</button>
+    </div>
+
+    <div class="semantic-row" data-htmlswap-region="smoke.semantic-buttons">
+        <button id="delete" data-htmlswap-tone="danger" data-htmlswap-variant="outline" data-htmlswap-size="sm" data-htmlswap-density="compact">Delete</button>
+        <button id="complete" data-htmlswap-tone="success" data-htmlswap-variant="ghost" data-htmlswap-size="lg">Complete</button>
+        <button id="help" data-htmlswap-tone="warning" data-htmlswap-variant="link" data-htmlswap-size="xs">Help</button>
+        <button id="details" data-htmlswap-tone="info" data-htmlswap-size="md">Details</button>
+    </div>
+
+    <div class="template-grid">
+        <sc-for list="{{ items }}" as="item">
+            <button class="template-card" onclick="{{ item.onSelect }}">{{ item.label }}</button>
+        </sc-for>
+    </div>
+
+    <div class="fluid-grid">
+        <span>Auto-fit fallback</span>
+        <span>Uses flex wrap</span>
+    </div>
+</section>
