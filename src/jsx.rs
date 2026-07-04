@@ -191,7 +191,10 @@ pub(crate) fn compile_svelte_project(
 
     for module in registry.modules.values() {
         artifact.add_file(
-            GeneratedFile::new(module.path.clone(), module.body.clone()),
+            GeneratedFile::new(
+                module.path.clone(),
+                rewrite_project_ts_value_references(&module.path, &module.body, &registry),
+            ),
             &mut adapter_context,
         );
     }
@@ -804,6 +807,25 @@ fn resolve_project_component_node(node: &mut RenderNode, registry: &JsxProjectRe
 }
 
 fn rewrite_project_value_references(code: &str, registry: &JsxProjectRegistry) -> String {
+    let (rewritten, imports) = rewrite_project_value_references_with_imports(code, registry, None);
+    insert_svelte_project_imports(&rewritten, imports)
+}
+
+fn rewrite_project_ts_value_references(
+    module_path: &str,
+    code: &str,
+    registry: &JsxProjectRegistry,
+) -> String {
+    let (rewritten, imports) =
+        rewrite_project_value_references_with_imports(code, registry, Some(module_path));
+    insert_ts_project_imports(&rewritten, imports)
+}
+
+fn rewrite_project_value_references_with_imports(
+    code: &str,
+    registry: &JsxProjectRegistry,
+    current_module: Option<&str>,
+) -> (String, BTreeMap<String, BTreeSet<String>>) {
     let mut rewritten = code.to_owned();
     let mut imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut values = registry.value_symbols();
@@ -816,19 +838,18 @@ fn rewrite_project_value_references(code: &str, registry: &JsxProjectRegistry) -
         }
         rewritten = rewritten.replace(&needle, name);
         if let Some(module) = registry.module_for_value(name) {
-            imports
-                .entry(format!("./{module}"))
-                .or_default()
-                .insert(name.to_owned());
+            insert_project_import(&mut imports, current_module, module, name);
         }
     }
-    rewritten = rewrite_project_window_destructures(&rewritten, registry, &mut imports);
-    insert_svelte_project_imports(&rewritten, imports)
+    rewritten =
+        rewrite_project_window_destructures(&rewritten, registry, current_module, &mut imports);
+    (rewritten, imports)
 }
 
 fn rewrite_project_window_destructures(
     code: &str,
     registry: &JsxProjectRegistry,
+    current_module: Option<&str>,
     imports: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> String {
     let mut output = String::new();
@@ -863,14 +884,26 @@ fn rewrite_project_window_destructures(
         }
         for name in names {
             if let Some(module) = registry.module_for_value(name) {
-                imports
-                    .entry(format!("./{module}"))
-                    .or_default()
-                    .insert(name.to_owned());
+                insert_project_import(imports, current_module, module, name);
             }
         }
     }
     output
+}
+
+fn insert_project_import(
+    imports: &mut BTreeMap<String, BTreeSet<String>>,
+    current_module: Option<&str>,
+    module: &str,
+    name: &str,
+) {
+    if current_module == Some(module) {
+        return;
+    }
+    imports
+        .entry(format!("./{module}"))
+        .or_default()
+        .insert(name.to_owned());
 }
 
 fn insert_svelte_project_imports(
@@ -904,6 +937,23 @@ fn insert_svelte_project_imports(
     } else {
         format!("{import_block}\n{code}")
     }
+}
+
+fn insert_ts_project_imports(code: &str, imports: BTreeMap<String, BTreeSet<String>>) -> String {
+    if imports.is_empty() {
+        return code.to_owned();
+    }
+    let import_block = imports
+        .into_iter()
+        .map(|(module, names)| {
+            format!(
+                "import {{ {} }} from {};\n",
+                names.into_iter().collect::<Vec<_>>().join(", "),
+                js_string_literal(&module)
+            )
+        })
+        .collect::<String>();
+    format!("{import_block}\n{code}")
 }
 
 fn synthetic_arrow_component_source(
