@@ -1240,7 +1240,7 @@ impl<'a> JsxLowerer<'a> {
         let props = self.function_props_pattern(component.function);
         self.collect_component_bindings(body, props.as_deref());
         let mut prelude = self.source_logic_prelude(program, body, &component);
-        let nodes = self.lower_return_expression(return_expression);
+        let nodes = self.lower_component_return_nodes(body, return_expression);
         if !self.inlined_component_items.is_empty() {
             prelude
                 .component
@@ -1684,7 +1684,7 @@ impl<'a> JsxLowerer<'a> {
             }
         }
 
-        for statement in component_setup_statements(body) {
+        for statement in component_setup_statements(body, self.source) {
             let Statement::VariableDeclaration(declaration) = statement else {
                 continue;
             };
@@ -1702,7 +1702,7 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn component_logic_items(&mut self, body: &'a FunctionBody<'a>) -> Vec<RenderSourceLogicItem> {
-        let statements = component_setup_statements(body);
+        let statements = component_setup_statements(body, self.source);
         let mut items = Vec::new();
         let mut index = 0usize;
         while index < statements.len() {
@@ -2340,6 +2340,251 @@ return groups;"
                 Vec::new()
             }
         }
+    }
+
+    fn lower_component_return_nodes(
+        &mut self,
+        body: &'a FunctionBody<'a>,
+        return_expression: &'a Expression<'a>,
+    ) -> Vec<RenderNode> {
+        let setup_statements = body
+            .statements
+            .iter()
+            .take_while(|statement| !matches!(statement, Statement::ReturnStatement(_)))
+            .collect::<Vec<_>>();
+        let Some(first_guard) = setup_statements
+            .iter()
+            .position(|statement| self.component_return_guard(statement).is_some())
+        else {
+            return self.lower_return_expression(return_expression);
+        };
+        self.lower_component_return_sequence(&setup_statements[first_guard..], return_expression)
+    }
+
+    fn lower_component_return_sequence(
+        &mut self,
+        statements: &[&'a Statement<'a>],
+        return_expression: &'a Expression<'a>,
+    ) -> Vec<RenderNode> {
+        let mut setup_locals = Vec::new();
+        let mut index = 0usize;
+        while let Some(statement) = statements.get(index) {
+            let Some((test, expression, span, branch_locals)) =
+                self.component_return_guard(statement)
+            else {
+                if let Some((mut new_locals, consumed)) =
+                    self.control_flow_setup_locals(statements, index)
+                {
+                    setup_locals.append(&mut new_locals);
+                    index += consumed;
+                    continue;
+                }
+                self.diagnostics.push(Diagnostic::warning(
+                    "JSX setup after an early return must be variable declarations to become branch-local Svelte markup",
+                    Some(self.span(statement.span())),
+                ));
+                index += 1;
+                continue;
+            };
+            let condition = self.lower_expression(test);
+            let children = self.lower_return_expression(expression);
+            let else_children =
+                self.lower_component_return_sequence(&statements[index + 1..], return_expression);
+            let nodes = if children.is_empty() {
+                vec![self.control_flow_wrapper(
+                    RenderControlFlowKind::If,
+                    Some(self.negated_condition(test)),
+                    span,
+                    else_children,
+                    Vec::new(),
+                )]
+            } else {
+                let mut nodes = vec![self.control_flow_wrapper(
+                    RenderControlFlowKind::If,
+                    Some(condition),
+                    span,
+                    children,
+                    branch_locals,
+                )];
+                if !else_children.is_empty() {
+                    nodes.push(self.control_flow_wrapper(
+                        RenderControlFlowKind::Else,
+                        None,
+                        return_expression.span(),
+                        else_children,
+                        Vec::new(),
+                    ));
+                }
+                nodes
+            };
+            return self.with_control_flow_locals(setup_locals, span, nodes);
+        }
+
+        let nodes = self.lower_return_expression(return_expression);
+        self.with_control_flow_locals(setup_locals, return_expression.span(), nodes)
+    }
+
+    fn with_control_flow_locals(
+        &self,
+        locals: Vec<RenderLoopLocal>,
+        span: OxcSpan,
+        nodes: Vec<RenderNode>,
+    ) -> Vec<RenderNode> {
+        if locals.is_empty() {
+            nodes
+        } else {
+            vec![self.control_flow_wrapper(
+                RenderControlFlowKind::If,
+                Some(Expr::Literal(ExprLiteral::Bool(true))),
+                span,
+                nodes,
+                locals,
+            )]
+        }
+    }
+
+    fn negated_condition(&self, expression: &Expression<'a>) -> Expr {
+        Expr::Opaque(
+            format!(
+                "!({})",
+                self.rewrite_react_source(self.source_for_span(expression.span()).trim())
+            )
+            .into(),
+        )
+    }
+
+    fn control_flow_setup_locals(
+        &mut self,
+        statements: &[&'a Statement<'a>],
+        index: usize,
+    ) -> Option<(Vec<RenderLoopLocal>, usize)> {
+        let statement = statements.get(index)?;
+        let Statement::VariableDeclaration(declaration) = statement else {
+            return None;
+        };
+        if let Some((local, consumed)) = self.control_flow_derived_block_local(statements, index) {
+            return Some((vec![local], consumed));
+        }
+        let locals = self.control_flow_locals(declaration);
+        (!locals.is_empty()).then_some((locals, 1))
+    }
+
+    fn control_flow_derived_block_local(
+        &mut self,
+        statements: &[&'a Statement<'a>],
+        index: usize,
+    ) -> Option<(RenderLoopLocal, usize)> {
+        let Statement::VariableDeclaration(declaration) = statements.get(index)? else {
+            return None;
+        };
+        if declaration.kind != VariableDeclarationKind::Let || declaration.declarations.len() != 1 {
+            return None;
+        }
+        let declarator = declaration.declarations.first()?;
+        let name = binding_identifier_name(&declarator.id)?;
+        let init = declarator.init.as_ref()?;
+        let mut consumed = 1usize;
+        let mut body = format!(
+            "(() => {{\nlet {name} = {};",
+            self.rewrite_react_source(self.source_for_span(init.span()).trim())
+        );
+        while let Some(statement) = statements.get(index + consumed) {
+            let source = self.source_for_span(statement.span());
+            if !source_contains_assignment_to(source, name.as_str()) {
+                break;
+            }
+            body.push('\n');
+            body.push_str(&self.rewrite_react_source(source.trim()));
+            consumed += 1;
+        }
+        if consumed == 1 {
+            return None;
+        }
+        body.push_str("\nreturn ");
+        body.push_str(name.as_str());
+        body.push_str(";\n})()");
+        Some((
+            RenderLoopLocal {
+                name,
+                value: Expr::Opaque(body.into()),
+                span: Some(self.span(declarator.span)),
+            },
+            consumed,
+        ))
+    }
+
+    fn component_return_guard(
+        &mut self,
+        statement: &'a Statement<'a>,
+    ) -> Option<(
+        &'a Expression<'a>,
+        &'a Expression<'a>,
+        OxcSpan,
+        Vec<RenderLoopLocal>,
+    )> {
+        let Statement::IfStatement(statement) = statement else {
+            return None;
+        };
+        if statement.alternate.is_some() {
+            return None;
+        }
+        let (expression, locals) = self.return_guard_expression(&statement.consequent)?;
+        Some((&statement.test, expression, statement.span, locals))
+    }
+
+    fn return_guard_expression(
+        &mut self,
+        statement: &'a Statement<'a>,
+    ) -> Option<(&'a Expression<'a>, Vec<RenderLoopLocal>)> {
+        match statement {
+            Statement::ReturnStatement(statement) => {
+                let expression = statement.argument.as_ref()?;
+                render_return_expression(expression, self.source)
+                    .then_some((expression, Vec::new()))
+            }
+            Statement::BlockStatement(block) => {
+                let mut locals = Vec::new();
+                for statement in &block.body {
+                    match statement {
+                        Statement::VariableDeclaration(declaration) => {
+                            locals.extend(self.control_flow_locals(declaration));
+                        }
+                        Statement::ReturnStatement(statement) => {
+                            let expression = statement.argument.as_ref()?;
+                            return render_return_expression(expression, self.source)
+                                .then_some((expression, locals));
+                        }
+                        _ => return None,
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn control_flow_locals(
+        &mut self,
+        declaration: &'a oxc_ast::ast::VariableDeclaration<'a>,
+    ) -> Vec<RenderLoopLocal> {
+        declaration
+            .declarations
+            .iter()
+            .filter_map(|declarator| {
+                let init = declarator.init.as_ref()?;
+                let name = binding_identifier_name(&declarator.id).unwrap_or_else(|| {
+                    CompactString::from(self.source_for_span(declarator.id.span()).trim())
+                });
+                Some(RenderLoopLocal {
+                    name,
+                    value: Expr::Opaque(
+                        self.rewrite_react_source(self.source_for_span(init.span()))
+                            .into(),
+                    ),
+                    span: Some(self.span(declarator.span)),
+                })
+            })
+            .collect()
     }
 
     fn lower_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) -> Vec<RenderNode> {
@@ -3798,6 +4043,59 @@ fn return_expression_from_statement<'b, 'a>(
     }
 }
 
+fn statement_is_component_return_guard(statement: &Statement<'_>, source: &str) -> bool {
+    let Statement::IfStatement(statement) = statement else {
+        return false;
+    };
+    statement.alternate.is_none()
+        && render_return_expression_from_statement(&statement.consequent, source)
+}
+
+fn render_return_expression_from_statement(statement: &Statement<'_>, source: &str) -> bool {
+    match statement {
+        Statement::ReturnStatement(statement) => statement
+            .argument
+            .as_ref()
+            .is_some_and(|expression| render_return_expression(expression, source)),
+        Statement::BlockStatement(block) => {
+            let mut saw_return = false;
+            for statement in &block.body {
+                match statement {
+                    Statement::VariableDeclaration(_) => {}
+                    Statement::ReturnStatement(statement) => {
+                        saw_return = statement
+                            .argument
+                            .as_ref()
+                            .is_some_and(|expression| render_return_expression(expression, source));
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+            saw_return
+        }
+        _ => false,
+    }
+}
+
+fn render_return_expression(expression: &Expression<'_>, source: &str) -> bool {
+    match expression {
+        Expression::ParenthesizedExpression(expression) => {
+            render_return_expression(&expression.expression, source)
+        }
+        Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
+        Expression::NullLiteral(_) => true,
+        Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => {
+            render_return_expression(&logical.right, source)
+        }
+        Expression::ConditionalExpression(conditional) => {
+            render_return_expression(&conditional.consequent, source)
+                && render_return_expression(&conditional.alternate, source)
+        }
+        _ => false,
+    }
+}
+
 fn assignment_target_is_window_member(target: &AssignmentTarget<'_>) -> bool {
     let AssignmentTarget::StaticMemberExpression(member) = target else {
         return false;
@@ -4003,10 +4301,16 @@ fn remove_state_item(items: &mut Vec<RenderSourceLogicItem>, name: &str) {
     });
 }
 
-fn component_setup_statements<'b, 'a>(body: &'b FunctionBody<'a>) -> Vec<&'b Statement<'a>> {
+fn component_setup_statements<'b, 'a>(
+    body: &'b FunctionBody<'a>,
+    source: &str,
+) -> Vec<&'b Statement<'a>> {
     body.statements
         .iter()
-        .take_while(|statement| !matches!(statement, Statement::ReturnStatement(_)))
+        .take_while(|statement| {
+            !matches!(statement, Statement::ReturnStatement(_))
+                && !statement_is_component_return_guard(statement, source)
+        })
         .collect()
 }
 

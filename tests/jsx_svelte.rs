@@ -1,7 +1,8 @@
 use htmlswap::{
-    Adapter, AdapterContext, CompileAssets, Compiler, CompilerOptions, SourceFrontendKind,
-    SvelteAdapter, SvelteAdapterOptions,
+    Adapter, AdapterArtifact, AdapterContext, CompileAssets, Compiler, CompilerOptions,
+    SourceFrontendKind, SvelteAdapter, SvelteAdapterOptions,
 };
+use std::path::{Path, PathBuf};
 
 fn emit_svelte_jsx(source: &str) -> String {
     let (code, diagnostics) = emit_svelte_jsx_with_diagnostics(source);
@@ -37,6 +38,165 @@ fn emit_svelte_jsx_with_diagnostics(source: &str) -> (String, Vec<String>) {
             .map(|diagnostic| diagnostic.message.clone()),
     );
     (output.code().to_owned(), diagnostics)
+}
+
+fn emit_svelte_jsx_project_from_dir(root: &Path) -> (AdapterArtifact, Vec<String>) {
+    let compiler = Compiler::try_with_options(
+        CompilerOptions::new().with_source_frontend(SourceFrontendKind::Jsx),
+    )
+    .expect("compiler options should be valid");
+    let mut sources = jsx_project_sources(root);
+    sources.sort_by(|left, right| left.0.cmp(&right.0));
+    let compiled = compiler.compile_jsx_svelte_project(
+        sources,
+        SvelteAdapterOptions {
+            component_name: "View".into(),
+            emit_source_comments: false,
+            ..Default::default()
+        },
+    );
+    let diagnostics = compiled
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    (compiled.value, diagnostics)
+}
+
+fn jsx_project_sources(root: &Path) -> Vec<(String, String)> {
+    std::fs::read_dir(root)
+        .expect("fixture directory should be readable")
+        .map(|entry| entry.expect("fixture entry should be readable").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsx"))
+        .filter(|path| {
+            !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    matches!(
+                        name,
+                        "design-canvas.jsx" | "tweaks-panel.jsx" | "theme-tweaks.jsx"
+                    )
+                })
+        })
+        .map(|path| {
+            let name = path.to_string_lossy().replace('\\', "/");
+            let source = std::fs::read_to_string(&path).expect("fixture should be readable");
+            (name, source)
+        })
+        .collect()
+}
+
+fn generated_file<'a>(artifact: &'a AdapterArtifact, path: &str) -> &'a str {
+    artifact
+        .files
+        .iter()
+        .find(|file| file.path == path)
+        .unwrap_or_else(|| panic!("expected generated file `{path}`"))
+        .contents
+        .as_str()
+}
+
+fn assert_project_has_no_unresolved_internal_refs(artifact: &AdapterArtifact) {
+    for file in &artifact.files {
+        assert!(
+            !file.contents.contains("htmlswap-jsx-component-placeholder"),
+            "{} still contains JSX component placeholder:\n{}",
+            file.path,
+            file.contents
+        );
+        assert!(
+            !file.contents.contains("unsupported JSX component"),
+            "{} still contains unsupported component text",
+            file.path
+        );
+        assert!(
+            !file.contents.contains("window."),
+            "{} still contains a corpus-internal window reference:\n{}",
+            file.path,
+            file.contents
+        );
+    }
+}
+
+#[test]
+fn project_mode_resolves_component_data_member_and_alias_imports() {
+    let (artifact, diagnostics) =
+        emit_svelte_jsx_project_from_dir(Path::new("tests/fixtures/jsx/project"));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    let view = generated_file(&artifact, "View.svelte");
+    assert!(
+        view.contains("import Badge from \"./Badge.svelte\";"),
+        "{view}"
+    );
+    assert!(
+        view.contains("import IconSearch from \"./IconSearch.svelte\";"),
+        "{view}"
+    );
+    assert!(
+        view.contains("import KindBadge from \"./KindBadge.svelte\";"),
+        "{view}"
+    );
+    assert!(
+        view.contains("import { nodeOf } from './graph-data.ts';"),
+        "{view}"
+    );
+    assert!(view.contains("<Badge label={node.path}>"), "{view}");
+    assert!(view.contains("<IconSearch size={16}>"), "{view}");
+    assert!(view.contains("<KindBadge kind={node.kind}>"), "{view}");
+
+    let graph_data = generated_file(&artifact, "graph-data.ts");
+    assert!(graph_data.contains("export const NODES"), "{graph_data}");
+    assert!(
+        graph_data.contains("export function nodeOf"),
+        "{graph_data}"
+    );
+    assert_project_has_no_unresolved_internal_refs(&artifact);
+}
+
+#[test]
+fn corpus_project_mode_emits_no_unresolved_internal_refs() {
+    let Some(corpus) = std::env::var_os("HTMLSWAP_JSX_CORPUS") else {
+        eprintln!("skipping optional corpus smoke test; HTMLSWAP_JSX_CORPUS is not set");
+        return;
+    };
+    let corpus = PathBuf::from(corpus);
+    if !corpus.exists() {
+        eprintln!("skipping corpus smoke test; {} is absent", corpus.display());
+        return;
+    }
+
+    let (artifact, diagnostics) = emit_svelte_jsx_project_from_dir(&corpus);
+    let serious = diagnostics
+        .iter()
+        .filter(|message| {
+            message.contains("parser stopped")
+                || message.contains("outside Phase")
+                || message.contains("unsupported JSX component")
+                || message.contains("Svelte adapter failed")
+        })
+        .collect::<Vec<_>>();
+    assert!(serious.is_empty(), "{diagnostics:?}");
+    assert!(
+        artifact
+            .files
+            .iter()
+            .any(|file| file.path == "graph-data.ts")
+    );
+    assert!(
+        artifact
+            .files
+            .iter()
+            .any(|file| file.path == "Explorer.svelte")
+    );
+    assert!(
+        artifact
+            .files
+            .iter()
+            .any(|file| file.path == "IconSearch.svelte")
+    );
+    assert_project_has_no_unresolved_internal_refs(&artifact);
 }
 
 #[test]
