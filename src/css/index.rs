@@ -1,6 +1,9 @@
 use compact_str::CompactString;
 
-use crate::plan::{RenderStyleCondition, RenderStyleVariant, RenderThemePlan, RenderThemeScope};
+use crate::plan::{
+    RenderStyleCondition, RenderStyleVariant, RenderStylesheetRule, RenderThemePlan,
+    RenderThemeScope,
+};
 use crate::style::{StyleDeclaration, StyleProperty, StyleValue};
 
 use super::{CssRule, StyleElement, Stylesheet};
@@ -27,10 +30,11 @@ impl StyleIndex {
     #[must_use]
     pub(crate) fn styles_for_element(&self, element: &StyleElement<'_, '_>) -> ElementStyles {
         let mut applied = Vec::<AppliedDeclaration>::new();
-        let mut source_order = 0usize;
+        let mut declaration_order = 0usize;
+        let mut matched_rules = Vec::new();
         let mut variants = Vec::new();
 
-        for rule in &self.rules {
+        for (rule_source_order, rule) in self.rules.iter().enumerate() {
             if let Some(variant) = variant_for_rule(rule, element) {
                 variants.push(variant);
             }
@@ -40,9 +44,17 @@ impl StyleIndex {
             }
 
             let Some(specificity) = rule.selector.matching_specificity(element) else {
-                source_order += rule.declarations.len();
+                declaration_order += rule.declarations.len();
                 continue;
             };
+
+            matched_rules.push(RenderStylesheetRule {
+                source_order: rule_source_order,
+                selector: CompactString::from(rule.selector.raw.as_str()),
+                conditions: Vec::new(),
+                declarations: rule.declarations.clone(),
+                span: rule.span,
+            });
 
             for declaration in &rule.declarations {
                 let candidate = AppliedDeclaration {
@@ -50,7 +62,7 @@ impl StyleIndex {
                     key: CascadeKey {
                         important: declaration.important,
                         specificity,
-                        source_order,
+                        source_order: declaration_order,
                     },
                 };
 
@@ -65,7 +77,7 @@ impl StyleIndex {
                     applied.push(candidate);
                 }
 
-                source_order += 1;
+                declaration_order += 1;
             }
         }
 
@@ -74,6 +86,7 @@ impl StyleIndex {
                 .into_iter()
                 .map(|applied| applied.declaration)
                 .collect(),
+            matched_rules,
             variants,
         }
     }
@@ -107,6 +120,7 @@ impl StyleIndex {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ElementStyles {
     pub(crate) declarations: Vec<StyleDeclaration>,
+    pub(crate) matched_rules: Vec<RenderStylesheetRule>,
     pub(crate) variants: Vec<RenderStyleVariant>,
 }
 

@@ -912,6 +912,8 @@ impl<'a> JsxLowerer<'a> {
             attributes: Vec::new(),
             classes: Vec::new(),
             styles: Vec::new(),
+            stylesheet_rules: Vec::new(),
+            stylesheet_declarations: Vec::new(),
             style_variants: Vec::new(),
             dynamic_styles: Vec::new(),
             pseudo_elements: Vec::new(),

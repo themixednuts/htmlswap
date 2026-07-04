@@ -591,7 +591,20 @@ fn lower_element<'a>(
         let name = CompactString::from(attribute.name.local().to_ascii_lowercase());
 
         match name.as_str() {
-            "class" => classes.extend(attribute.value.split_whitespace().map(CompactString::from)),
+            "class" => {
+                if let Some(template) =
+                    parse_template(context, &attribute.value, attribute.span, runtime)
+                {
+                    attributes.push(RenderAttribute {
+                        name,
+                        value: attribute.value.clone(),
+                        template: Some(template),
+                        span: attribute.span,
+                    });
+                } else {
+                    classes.extend(attribute.value.split_whitespace().map(CompactString::from));
+                }
+            }
             "style" => {
                 if let Some(expression) =
                     parse_template(context, &attribute.value, attribute.span, runtime)
@@ -746,15 +759,35 @@ fn lower_element<'a>(
         }
     }
 
-    let (mut styles, style_variants) = context.styles.map_or_else(
-        || (Vec::new(), Vec::new()),
+    let (mut styles, style_variants, stylesheet_rules, stylesheet_winners) = context.styles.map_or_else(
+        || (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         |styles| {
             let style_element = StyleElement::new(element, ancestors, siblings, sibling_index);
             let element_styles = styles.styles_for_element(&style_element);
-            (element_styles.declarations, element_styles.variants)
+            let stylesheet_winners = element_styles.declarations;
+            (
+                stylesheet_winners.clone(),
+                element_styles.variants,
+                element_styles.matched_rules,
+                stylesheet_winners,
+            )
         },
     );
+    let inline_properties = inline_styles
+        .iter()
+        .map(|style| style.property.clone())
+        .collect::<Vec<_>>();
     merge_inline_styles(&mut styles, inline_styles);
+    let stylesheet_declarations = stylesheet_winners
+        .into_iter()
+        .filter(|declaration| !inline_properties.contains(&declaration.property))
+        .filter(|declaration| {
+            styles
+                .iter()
+                .find(|style| style.property == declaration.property)
+                .is_some_and(|style| style_declarations_match(style, declaration))
+        })
+        .collect::<Vec<_>>();
     let mut style_variants = style_variants;
     style_variants.extend(inline_style_variants);
     let (style_variants, pseudo_elements) = split_pseudo_elements(style_variants);
@@ -810,6 +843,8 @@ fn lower_element<'a>(
         attributes,
         classes,
         styles,
+        stylesheet_rules,
+        stylesheet_declarations,
         style_variants,
         dynamic_styles,
         pseudo_elements,
@@ -936,6 +971,10 @@ fn merge_inline_styles(styles: &mut Vec<StyleDeclaration>, inline_styles: Vec<St
             styles.push(inline_style);
         }
     }
+}
+
+fn style_declarations_match(left: &StyleDeclaration, right: &StyleDeclaration) -> bool {
+    left.property == right.property && left.value == right.value && left.important == right.important
 }
 
 fn script_styles_for_dynamic_expression<'a>(

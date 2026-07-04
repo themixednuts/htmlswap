@@ -108,6 +108,29 @@ fn svelte_adapter_emits_dc_control_flow_and_bindings() {
 }
 
 #[test]
+fn svelte_adapter_emits_dc_template_class_bindings() {
+    let pure = emit_svelte(
+        r#"<x-dc><button class="{{ key.className }}">Pure</button></x-dc>"#,
+        Frontend::dc(),
+    );
+    assert!(
+        pure.contains("<button class={key.className}>Pure</button>"),
+        "{pure}"
+    );
+    assert!(!pure.contains("{{"), "{pure}");
+
+    let mixed = emit_svelte(
+        r#"<x-dc><button class="keycap {{ key.className }}">Mixed</button></x-dc>"#,
+        Frontend::dc(),
+    );
+    assert!(
+        mixed.contains(r#"<button class={`keycap ${key.className}`}>Mixed</button>"#),
+        "{mixed}"
+    );
+    assert!(!mixed.contains("{{"), "{mixed}");
+}
+
+#[test]
 fn svelte_adapter_keeps_dc_component_hints_native_unless_imported() {
     let code = emit_svelte(
         r#"<x-dc><div data-htmlswap-component="nav-rail"><div data-htmlswap-slot="footer"><span>Footer</span></div></div></x-dc>"#,

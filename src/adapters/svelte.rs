@@ -129,6 +129,7 @@ struct SveltePrelude {
     uses_attachment: bool,
     uses_style_helper: bool,
     style_classes: BTreeMap<String, String>,
+    stylesheet_rules: BTreeMap<usize, String>,
     style_rules: Vec<String>,
 }
 
@@ -267,6 +268,9 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         let scope =
             scope_for_control_flow(element.control_flow.as_deref(), scope, &mut self.prelude);
         self.collect_browser_only_style_diagnostics(element);
+        if element_emits_dom_node(element) {
+            self.collect_stylesheet_rules(element);
+        }
         if element_needs_style_class(element) && element_emits_dom_node(element) {
             let class = format!("hs_{}", self.prelude.style_classes.len());
             self.prelude
@@ -393,6 +397,27 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
                 && !self.prelude.states.contains_key(invocation.action.as_str())
             {
                 self.prelude.prop(invocation.action.to_string());
+            }
+        }
+    }
+
+    fn collect_stylesheet_rules(&mut self, element: &RenderElement) {
+        for rule in &element.stylesheet_rules {
+            if self
+                .prelude
+                .stylesheet_rules
+                .contains_key(&rule.source_order)
+            {
+                continue;
+            }
+            if let Some(rule_text) = conditioned_style_rule(
+                rule.selector.to_string(),
+                &rule.conditions,
+                &rule.declarations,
+            ) {
+                self.prelude
+                    .stylesheet_rules
+                    .insert(rule.source_order, rule_text);
             }
         }
     }
@@ -900,7 +925,10 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
 
     fn write_style(&self, output: &mut String, plan: &RenderPlan) {
         let has_root = !plan.root.styles.is_empty() || !plan.root.style_variants.is_empty();
-        if !has_root && self.prelude.style_rules.is_empty() {
+        if !has_root
+            && self.prelude.stylesheet_rules.is_empty()
+            && self.prelude.style_rules.is_empty()
+        {
             return;
         }
         writeln!(output, "<style>").expect("writing to String cannot fail");
@@ -917,6 +945,9 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             {
                 write_indented_block(output, &rule, 1);
             }
+        }
+        for rule in self.prelude.stylesheet_rules.values() {
+            write_indented_block(output, rule, 1);
         }
         for rule in &self.prelude.style_rules {
             write_indented_block(output, rule, 1);
@@ -1392,12 +1423,17 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             }
         }
         let template = TemplateString::new("", segments, None);
-        write!(
-            output,
-            " class={{`{}`}}",
-            svelte_template_literal(&template)
-        )
-        .expect("writing to String cannot fail");
+        if let Some(expression) = template.single_expression() {
+            write!(output, " class={{{}}}", svelte_expr(expression))
+                .expect("writing to String cannot fail");
+        } else {
+            write!(
+                output,
+                " class={{`{}`}}",
+                svelte_template_literal(&template)
+            )
+            .expect("writing to String cannot fail");
+        }
     }
 
     fn write_template_attribute_value(
@@ -1428,7 +1464,7 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
     }
 
     fn write_style_attribute(&self, output: &mut String, element: &RenderElement, _scope: &Scope) {
-        let static_style = format_styles(&element.styles);
+        let static_style = format_styles(svelte_inline_styles(element));
         let dynamic = element
             .dynamic_styles
             .iter()
@@ -1662,7 +1698,11 @@ fn state_binding_attribute_name(element: &RenderElement) -> Option<&'static str>
 }
 
 fn element_has_static_or_dynamic_style(element: &RenderElement) -> bool {
-    !element.styles.is_empty() || !element.dynamic_styles.is_empty()
+    element
+        .styles
+        .iter()
+        .any(|style| !is_stylesheet_declaration(element, style))
+        || !element.dynamic_styles.is_empty()
 }
 
 fn attribute_key(name: &str) -> String {
@@ -2460,6 +2500,4 @@ const JS_KEYWORDS: &[&str] = &[
 ];
 
 const JS_GLOBALS: &[&str] = &[
-    "Array", "Boolean", "Date", "Error", "JSON", "Math", "Number", "Object", "Promise", "String",
-    "console", "document", "window",
-];
+    "Array", "Boolean", "Date", "Error

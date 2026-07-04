@@ -615,6 +615,8 @@ pub struct RenderElement {
     pub attributes: Vec<RenderAttribute>,
     pub classes: Vec<CompactString>,
     pub styles: Vec<StyleDeclaration>,
+    pub stylesheet_rules: Vec<RenderStylesheetRule>,
+    pub stylesheet_declarations: Vec<StyleDeclaration>,
     pub style_variants: Vec<RenderStyleVariant>,
     pub dynamic_styles: Vec<RenderDynamicStyleBinding>,
     pub pseudo_elements: Vec<RenderPseudoElement>,
@@ -1384,6 +1386,15 @@ pub struct RenderSourceProp {
 pub struct RenderStyleVariant {
     pub conditions: Vec<RenderStyleCondition>,
     pub selector: CompactString,
+    pub declarations: Vec<StyleDeclaration>,
+    pub span: Option<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderStylesheetRule {
+    pub source_order: usize,
+    pub selector: CompactString,
+    pub conditions: Vec<RenderStyleCondition>,
     pub declarations: Vec<StyleDeclaration>,
     pub span: Option<Span>,
 }
