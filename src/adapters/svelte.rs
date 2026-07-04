@@ -317,6 +317,15 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
     }
     fn collect_element(&mut self, element: &RenderElement, scope: &Scope, path: &str) {
+        if let Some(component) = jsx_component_placeholder_name(element) {
+            self.cx.push(Diagnostic::warning(
+                format!(
+                    "JSX component tag `{component}` is outside Phase 1 scope; emitted placeholder"
+                ),
+                element.span,
+            ));
+            return;
+        }
         if let Some(style_block) = inline_style_block(element) {
             self.prelude.inline_style_blocks.push(style_block);
             return;
@@ -433,6 +442,11 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             if self.prelude.states.contains_key(&root)
                 || scope.is_local(&root)
                 || should_skip_prop_name(&root)
+                || self
+                    .prelude
+                    .source_logic
+                    .as_ref()
+                    .is_some_and(|logic| jsx_source_logic_declares(logic, &root))
             {
                 continue;
             }
@@ -670,10 +684,46 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
     }
 
     fn write_jsx_source_logic(&self, output: &mut String, logic: &RenderSourceLogic) {
+        self.write_jsx_props(output, logic);
         self.write_indented_source_logic_body(output, logic);
         if !logic.body.trim().is_empty() {
             writeln!(output).expect("writing to String cannot fail");
         }
+    }
+
+    fn write_jsx_props(&self, output: &mut String, logic: &RenderSourceLogic) {
+        let mut entries = Vec::new();
+        if let Some(data_props) = &logic.data_props {
+            let data_props = data_props.trim();
+            if let Some(inner) = data_props
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+            {
+                let inner = inner.trim();
+                if !inner.is_empty() {
+                    entries.push(inner.to_owned());
+                }
+            } else if !data_props.is_empty() {
+                writeln!(output, "\tlet {data_props} = $props();")
+                    .expect("writing to String cannot fail");
+            }
+        }
+        for prop in self.prelude.props.values() {
+            if jsx_props_entries_contain(&entries, &prop.name)
+                || jsx_source_logic_declares(logic, &prop.name)
+            {
+                continue;
+            }
+            match &prop.default {
+                Some(default) => entries.push(format!("{} = {default}", prop.name)),
+                None => entries.push(prop.name.clone()),
+            }
+        }
+        if entries.is_empty() {
+            return;
+        }
+        writeln!(output, "\tlet {{ {} }} = $props();", entries.join(", "))
+            .expect("writing to String cannot fail");
     }
 
     fn write_source_logic_bridge(&self, output: &mut String, logic: &RenderSourceLogic) {
@@ -1292,6 +1342,10 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             self.write_nodes(output, &element.children, depth, scope, path);
             return;
         }
+        if let Some(component) = jsx_component_placeholder_name(element) {
+            self.write_jsx_component_placeholder(output, component, depth);
+            return;
+        }
         if inline_style_block(element).is_some() {
             return;
         }
@@ -1306,6 +1360,24 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             return;
         }
         self.write_element(output, element, depth, scope, path);
+    }
+
+    fn write_jsx_component_placeholder(&self, output: &mut String, component: &str, depth: usize) {
+        writeln!(
+            output,
+            "{}<div class=\"htmlswap-jsx-component-placeholder\" data-htmlswap-jsx-component-placeholder=\"{}\">",
+            indent(depth),
+            escape_html_attribute(component)
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            output,
+            "{}[unsupported JSX component: {}]",
+            indent(depth + 1),
+            escape_svelte_text(component)
+        )
+        .expect("writing to String cannot fail");
+        writeln!(output, "{}</div>", indent(depth)).expect("writing to String cannot fail");
     }
 
     fn write_element(
@@ -1401,6 +1473,15 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
         for attribute in &element.attributes {
             let name = attribute.name.as_str();
+            if name == "{...}" {
+                if let Some(template) = &attribute.template
+                    && let Some(expression) = template.single_expression()
+                {
+                    write!(output, " {{...{}}}", svelte_expr(expression))
+                        .expect("writing to String cannot fail");
+                }
+                continue;
+            }
             if name == "data-htmlswap-attach" {
                 if !written_attributes.insert(attribute_key(name)) {
                     continue;
@@ -1650,6 +1731,10 @@ fn scope_for_control_flow(
         if let Some(root) = control_flow.expression.as_ref().and_then(simple_expr_root)
             && !scope.is_local(&root)
             && !prelude.states.contains_key(&root)
+            && !prelude
+                .source_logic
+                .as_ref()
+                .is_some_and(|logic| jsx_source_logic_declares(logic, &root))
         {
             prelude.prop_with_default(root, "[]");
         }
@@ -1770,7 +1855,7 @@ fn tag_for_element(element: &RenderElement) -> String {
 fn is_control_flow_wrapper(element: &RenderElement) -> bool {
     matches!(
         element.source_tag.as_str(),
-        "sc-for" | "sc-if" | "sc-else" | "sc-else-if" | "x-dc"
+        "sc-for" | "sc-if" | "sc-else" | "sc-else-if" | "x-dc" | "jsx-fragment"
     ) || matches!(
         element
             .control_flow
@@ -1807,6 +1892,7 @@ fn should_emit_svelte_component(element: &RenderElement) -> bool {
     };
     source_intent.component.is_some()
         && (matches!(element.source_tag.as_str(), "dc-import" | "x-import")
+            || element.source_tag == "jsx-component"
             || source_intent.component_source.is_some())
 }
 
@@ -1843,6 +1929,14 @@ fn element_has_static_or_dynamic_style(element: &RenderElement) -> bool {
         .iter()
         .any(|style| !is_stylesheet_declaration(element, style))
         || !element.dynamic_styles.is_empty()
+}
+
+fn jsx_component_placeholder_name(element: &RenderElement) -> Option<&str> {
+    element
+        .attributes
+        .iter()
+        .find(|attribute| attribute.name == "data-htmlswap-jsx-component-placeholder")
+        .map(|attribute| attribute.value.as_str())
 }
 
 fn inline_style_block(element: &RenderElement) -> Option<String> {
@@ -2475,6 +2569,37 @@ fn component_name(value: &str) -> String {
     } else {
         name
     }
+}
+
+fn jsx_props_entries_contain(entries: &[String], name: &str) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'))
+            .any(|part| part == name)
+    })
+}
+
+fn jsx_source_logic_declares(logic: &RenderSourceLogic, name: &str) -> bool {
+    if !logic.dialect.eq_ignore_ascii_case("jsx") {
+        return false;
+    }
+    if logic
+        .data_props
+        .as_ref()
+        .is_some_and(|props| jsx_props_entries_contain(&[props.to_string()], name))
+    {
+        return true;
+    }
+    let body = logic.body.as_str();
+    [
+        format!("const {name}"),
+        format!("let {name}"),
+        format!("var {name}"),
+        format!("function {name}"),
+        format!("class {name}"),
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
 }
 
 fn source_logic_uses_mount(logic: &RenderSourceLogic) -> bool {

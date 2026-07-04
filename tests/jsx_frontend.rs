@@ -114,6 +114,62 @@ fn discovers_exported_function_components_without_leaking_export_syntax() {
     }
 }
 
+#[test]
+fn lowers_jsx_components_to_source_intent_and_spread_attrs() {
+    let compiled = compile_jsx(
+        r#"
+function Demo() {
+  const props = { tone: 'warm' };
+  return <Card {...props} title="Hello"><span>Child</span></Card>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    let RenderNode::Element(element) = &compiled.plan.nodes[0] else {
+        panic!("expected component element");
+    };
+    assert_eq!(element.source_tag, "jsx-component");
+    let intent = element
+        .source_intent
+        .as_ref()
+        .expect("component should carry source intent");
+    assert!(intent.component.as_ref().is_some_and(|id| id.is("Card")));
+    assert!(
+        intent
+            .props
+            .iter()
+            .any(|prop| prop.name == "title" && prop.value == "Hello")
+    );
+    assert!(
+        element
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name == "{...}" && attribute.template.is_some())
+    );
+}
+
+#[test]
+fn compiles_shared_component_modules_without_copying_jsx_into_script() {
+    let compiled = compile_jsx(
+        r#"
+const Icon = {
+  search: (p = {}) => <svg {...p}><path d="M0 0" /></svg>,
+};
+const TOKEN = { bg: 'var(--panel)' };
+function TopBar() { return <header />; }
+Object.assign(window, { Icon, TopBar });
+"#,
+    );
+
+    assert!(compiled.plan.nodes.is_empty());
+    let script = compiled.plan.source_logic[0].body.as_str();
+    assert!(script.contains("const TOKEN"));
+    assert!(!script.contains("<svg"));
+    assert!(!script.contains("function TopBar"));
+    assert!(!script.contains("Object.assign"));
+}
+
 fn collect_control_flow_elements(nodes: &[RenderNode]) -> Vec<&RenderElement> {
     let mut elements = Vec::new();
     for node in nodes {

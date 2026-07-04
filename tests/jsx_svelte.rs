@@ -148,8 +148,8 @@ window.Demo = Demo;
 }
 
 #[test]
-fn emits_inline_style_block_and_component_placeholder_diagnostics() {
-    let (code, diagnostics) = emit_svelte_jsx_with_diagnostics(
+fn emits_inline_style_block_and_component_references() {
+    let code = emit_svelte_jsx(
         r#"
 function Demo() {
   return <div><TopBar /><style>{`@keyframes blink { 0% { opacity: 1 } 100% { opacity: 0 } }`}</style></div>;
@@ -161,12 +161,47 @@ window.Demo = Demo;
     assert!(code.contains("<style>"), "{code}");
     assert!(code.contains("@keyframes blink"), "{code}");
     assert!(!code.contains("<style>{"), "{code}");
+    assert!(code.contains("let { TopBar }"), "{code}");
+    assert!(code.contains("<TopBar>"), "{code}");
     assert!(
-        code.contains("data-htmlswap-jsx-component-placeholder=\"TopBar\""),
+        !code.contains("htmlswap-jsx-component-placeholder"),
         "{code}"
     );
-    assert!(
-        diagnostics.iter().any(|message| message.contains("TopBar")),
-        "{diagnostics:?}"
+}
+
+#[test]
+fn emits_component_spreads_and_member_component_refs() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo() {
+  const props = { title: 'Find' };
+  return <Icon.search {...props} size={12} className="icon" />;
+}
+window.Demo = Demo;
+"#,
     );
+
+    assert!(code.contains("let { IconSearch }"), "{code}");
+    assert!(
+        code.contains("<IconSearch {...props} size={12} className=\"icon\">"),
+        "{code}"
+    );
+    assert!(!code.contains("<Icon.search"), "{code}");
+}
+
+#[test]
+fn unwraps_fragments_and_moves_react_fragment_key_to_each() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo() {
+  return <div>{[1, 2].map(n => <React.Fragment key={n}><span>{n}</span></React.Fragment>)}</div>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    assert!(code.contains("{#each [1, 2] as n (n)}"), "{code}");
+    assert!(code.contains("<span>"), "{code}");
+    assert!(!code.contains("React.Fragment"), "{code}");
+    assert!(!code.contains("jsx-fragment"), "{code}");
 }

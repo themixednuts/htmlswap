@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use arcstr::ArcStr;
@@ -20,9 +21,9 @@ use crate::expr::{
     BindingPattern, Expr, ExprLiteral, ObjectEntry, TemplateSegment, TemplateString,
 };
 use crate::plan::{
-    RenderAttribute, RenderControlFlow, RenderControlFlowHost, RenderControlFlowKind,
+    ComponentId, RenderAttribute, RenderControlFlow, RenderControlFlowHost, RenderControlFlowKind,
     RenderDynamicStyleBinding, RenderElement, RenderLoopLocal, RenderNode, RenderPlan,
-    RenderSourceLogic, RenderText, UiRole,
+    RenderSourceIntent, RenderSourceLogic, RenderSourceProp, RenderText, UiRole,
 };
 use crate::source::{SourceId, Span};
 use crate::style::StyleDeclaration;
@@ -58,6 +59,7 @@ pub(crate) fn lower_jsx_module(
         source,
         source_id,
         diagnostics,
+        component_names: BTreeSet::new(),
     };
     let plan = lowerer.lower_program(&parsed.program);
     Compilation::new(plan, lowerer.diagnostics)
@@ -73,6 +75,7 @@ struct JsxLowerer<'a> {
     source: &'a str,
     source_id: SourceId,
     diagnostics: Diagnostics,
+    component_names: BTreeSet<CompactString>,
 }
 
 struct JsxComponent<'a> {
@@ -83,12 +86,27 @@ struct JsxComponent<'a> {
 
 impl<'a> JsxLowerer<'a> {
     fn lower_program(&mut self, program: &'a Program<'a>) -> RenderPlan {
+        self.component_names = self.discover_component_names(program);
         let Some(component) = self.find_component(program) else {
+            let mut plan = RenderPlan::new(Vec::new());
+            let prelude = self.module_source_logic_prelude(program, usize::MAX);
+            if !prelude.trim().is_empty() || !self.component_names.is_empty() {
+                if !prelude.trim().is_empty() {
+                    plan.source_logic.push(RenderSourceLogic {
+                        dialect: "jsx".into(),
+                        script_type: Some("module".into()),
+                        body: ArcStr::from(prelude),
+                        data_props: None,
+                        span: None,
+                    });
+                }
+                return plan;
+            }
             self.diagnostics.push(Diagnostic::error(
-                "JSX source must expose a function component through window.Name, export, or export default in Phase 0",
+                "JSX source must expose a function component through window.Name, export, export default, or Object.assign(window, ...) in Phase 2",
                 None,
             ));
-            return RenderPlan::new(Vec::new());
+            return plan;
         };
         let Some(body) = component.function.body.as_deref() else {
             self.diagnostics.push(Diagnostic::error(
@@ -106,17 +124,61 @@ impl<'a> JsxLowerer<'a> {
         };
 
         let mut plan = RenderPlan::new(self.lower_return_expression(return_expression));
-        let prelude = self.source_logic_prelude(body, component.module_end);
-        if !prelude.trim().is_empty() {
+        let prelude = self.source_logic_prelude(program, body, &component);
+        let props = self.function_props_pattern(component.function);
+        if !prelude.trim().is_empty() || props.is_some() {
             plan.source_logic.push(RenderSourceLogic {
                 dialect: "jsx".into(),
                 script_type: Some("module".into()),
                 body: ArcStr::from(prelude),
-                data_props: None,
+                data_props: props,
                 span: Some(self.span(component.function.span)),
             });
         }
         plan
+    }
+
+    fn discover_component_names(&self, program: &'a Program<'a>) -> BTreeSet<CompactString> {
+        let mut names = BTreeSet::new();
+        for statement in &program.body {
+            match statement {
+                Statement::FunctionDeclaration(function) => {
+                    if let Some(id) = &function.id
+                        && component_identifier_name(id.name.as_str())
+                        && function_body_contains_jsx(&function.body, self.source)
+                    {
+                        names.insert(id.name.as_str().into());
+                    }
+                }
+                Statement::VariableDeclaration(declaration) => {
+                    for declarator in &declaration.declarations {
+                        let Some(name) = binding_identifier_name(&declarator.id) else {
+                            continue;
+                        };
+                        if let Some(init) = &declarator.init {
+                            if component_identifier_name(name.as_str())
+                                && expression_contains_jsx(init, self.source)
+                            {
+                                names.insert(name);
+                                continue;
+                            }
+                            if let Expression::ObjectExpression(object) = init {
+                                self.discover_object_component_names(
+                                    name.as_str(),
+                                    object,
+                                    &mut names,
+                                );
+                            }
+                        }
+                    }
+                }
+                Statement::ExpressionStatement(statement) => {
+                    self.discover_window_object_assign_names(&statement.expression, &mut names);
+                }
+                _ => {}
+            }
+        }
+        names
     }
 
     fn find_component(&self, program: &'a Program<'a>) -> Option<JsxComponent<'a>> {
@@ -234,8 +296,59 @@ impl<'a> JsxLowerer<'a> {
         None
     }
 
-    fn source_logic_prelude(&self, body: &FunctionBody<'a>, module_end: usize) -> String {
-        let module = self.source.get(0..module_end).unwrap_or_default().trim();
+    fn discover_object_component_names(
+        &self,
+        object_name: &str,
+        object: &ObjectExpression<'a>,
+        names: &mut BTreeSet<CompactString>,
+    ) {
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(key) = self.property_key(&property.key) else {
+                continue;
+            };
+            if expression_contains_jsx(&property.value, self.source) {
+                names.insert(format!("{object_name}.{key}").into());
+            }
+        }
+    }
+
+    fn discover_window_object_assign_names(
+        &self,
+        expression: &Expression<'a>,
+        names: &mut BTreeSet<CompactString>,
+    ) {
+        let Expression::CallExpression(call) = expression else {
+            return;
+        };
+        if !call_is_object_assign_window(call) {
+            return;
+        }
+        let Some(Argument::ObjectExpression(object)) = call.arguments.get(1) else {
+            return;
+        };
+        for property in &object.properties {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                continue;
+            };
+            let Some(key) = self.property_key(&property.key) else {
+                continue;
+            };
+            if component_identifier_name(key.as_str()) {
+                names.insert(key);
+            }
+        }
+    }
+
+    fn source_logic_prelude(
+        &self,
+        program: &'a Program<'a>,
+        body: &FunctionBody<'a>,
+        component: &JsxComponent<'a>,
+    ) -> String {
+        let module = self.module_source_logic_prelude(program, component.module_end);
         let setup_start = body
             .statements
             .first()
@@ -262,6 +375,56 @@ impl<'a> JsxLowerer<'a> {
         }
     }
 
+    fn module_source_logic_prelude(&self, program: &'a Program<'a>, module_end: usize) -> String {
+        program
+            .body
+            .iter()
+            .filter(|statement| (statement.span().start as usize) < module_end)
+            .filter(|statement| !self.should_skip_module_statement(statement))
+            .filter_map(|statement| {
+                let source = self.source_for_span(statement.span()).trim();
+                (!source.is_empty()).then_some(source)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn should_skip_module_statement(&self, statement: &Statement<'a>) -> bool {
+        match statement {
+            Statement::FunctionDeclaration(function) => function
+                .id
+                .as_ref()
+                .is_some_and(|id| self.component_names.contains(id.name.as_str()))
+                || function_body_contains_jsx(&function.body, self.source),
+            Statement::VariableDeclaration(declaration) => declaration.declarations.iter().any(
+                |declarator| {
+                    let componentish_binding = binding_identifier_name(&declarator.id)
+                        .is_some_and(|name| component_identifier_name(name.as_str()));
+                    declarator
+                        .init
+                        .as_ref()
+                        .is_some_and(|init| expression_contains_jsx(init, self.source))
+                        || (componentish_binding
+                            && declarator.init.as_ref().is_some_and(|init| {
+                                matches!(init, Expression::Identifier(identifier) if component_identifier_name(identifier.name.as_str()))
+                            }))
+                },
+            ),
+            Statement::ExpressionStatement(statement) => {
+                expression_contains_jsx(&statement.expression, self.source)
+                    || expression_is_window_publish(&statement.expression)
+            }
+            Statement::ExportNamedDeclaration(_) | Statement::ExportDefaultDeclaration(_) => true,
+            _ => false,
+        }
+    }
+
+    fn function_props_pattern(&self, function: &Function<'a>) -> Option<CompactString> {
+        let param = function.params.items.first()?;
+        let source = self.source_for_span(param.pattern.span()).trim();
+        (!source.is_empty()).then(|| source.into())
+    }
+
     fn lower_return_expression(&mut self, expression: &Expression<'a>) -> Vec<RenderNode> {
         match expression {
             Expression::ParenthesizedExpression(expression) => {
@@ -280,17 +443,19 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn lower_jsx_fragment(&mut self, fragment: &JSXFragment<'a>) -> Vec<RenderNode> {
-        self.diagnostics.push(Diagnostic::error(
-            "JSX fragments are outside Phase 0 scope",
-            Some(self.span(fragment.span)),
-        ));
         self.lower_children(&fragment.children)
     }
 
     fn lower_jsx_element(&mut self, element: &JSXElement<'a>) -> (RenderNode, Option<Expr>) {
         let tag = self.jsx_element_name(&element.opening_element.name);
+        if tag == "React.Fragment" {
+            let (children, key) = self.lower_react_fragment_element(element);
+            let mut wrapper = self.empty_element("jsx-fragment", element.span);
+            wrapper.children = children;
+            return (RenderNode::Element(Box::new(wrapper)), key);
+        }
         if is_jsx_component_tag(&tag) {
-            return (self.lower_component_placeholder(&tag, element), None);
+            return self.lower_component_element(&tag, element);
         }
         if tag == "style" {
             return (self.lower_style_element(element), None);
@@ -306,10 +471,11 @@ impl<'a> JsxLowerer<'a> {
                     }
                 }
                 JSXAttributeItem::SpreadAttribute(spread) => {
-                    self.diagnostics.push(Diagnostic::error(
-                        "JSX spread attributes are outside Phase 1 scope",
-                        Some(self.span(spread.span)),
-                    ));
+                    self.push_spread_attribute(
+                        &mut render.attributes,
+                        &spread.argument,
+                        spread.span,
+                    );
                 }
             }
         }
@@ -317,28 +483,71 @@ impl<'a> JsxLowerer<'a> {
         (RenderNode::Element(Box::new(render)), key)
     }
 
-    fn lower_component_placeholder(&mut self, tag: &str, element: &JSXElement<'a>) -> RenderNode {
-        self.diagnostics.push(Diagnostic::warning(
-            format!("JSX component tag `{tag}` is outside Phase 1 scope; emitted placeholder"),
-            Some(self.span(element.opening_element.span)),
-        ));
+    fn lower_react_fragment_element(
+        &mut self,
+        element: &JSXElement<'a>,
+    ) -> (Vec<RenderNode>, Option<Expr>) {
+        let mut key = None;
+        for attribute in &element.opening_element.attributes {
+            match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    if self.jsx_attribute_name(&attribute.name) == "key" {
+                        key = attribute
+                            .value
+                            .as_ref()
+                            .and_then(|value| self.attribute_expr(value));
+                    }
+                }
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    self.diagnostics.push(Diagnostic::warning(
+                        "JSX React.Fragment spread attributes are ignored; only key is meaningful",
+                        Some(self.span(spread.span)),
+                    ));
+                }
+            }
+        }
+        (self.lower_children(&element.children), key)
+    }
 
-        let mut placeholder = self.empty_element("div", element.span);
-        placeholder
-            .classes
-            .push("htmlswap-jsx-component-placeholder".into());
-        placeholder.attributes.push(RenderAttribute {
-            name: "data-htmlswap-jsx-component-placeholder".into(),
-            value: tag.into(),
-            template: None,
-            span: Some(self.span(element.opening_element.span)),
-        });
-        placeholder.children.push(RenderNode::Text(RenderText {
-            value: format!("[unsupported JSX component: {tag}]"),
-            template: None,
-            span: Some(self.span(element.opening_element.span)),
+    fn lower_component_element(
+        &mut self,
+        tag: &str,
+        element: &JSXElement<'a>,
+    ) -> (RenderNode, Option<Expr>) {
+        let component = component_reference_name(tag);
+        let mut render = self.empty_element("jsx-component", element.span);
+        let mut key = None;
+        let mut props = Vec::new();
+        for attribute in &element.opening_element.attributes {
+            match attribute {
+                JSXAttributeItem::Attribute(attribute) => {
+                    if self.lower_component_attribute(attribute, &mut props, &mut key) {
+                        continue;
+                    }
+                }
+                JSXAttributeItem::SpreadAttribute(spread) => {
+                    self.push_spread_attribute(
+                        &mut render.attributes,
+                        &spread.argument,
+                        spread.span,
+                    );
+                }
+            }
+        }
+        render.source_intent = Some(Box::new(RenderSourceIntent {
+            key: key
+                .as_ref()
+                .map(ToString::to_string)
+                .map(CompactString::from),
+            state_id: None,
+            component: Some(ComponentId::new(component.as_str())),
+            component_source: None,
+            slot: None,
+            child_strategy: None,
+            props,
         }));
-        RenderNode::Element(Box::new(placeholder))
+        render.children = self.lower_children(&element.children);
+        (RenderNode::Element(Box::new(render)), key)
     }
 
     fn lower_style_element(&mut self, element: &JSXElement<'a>) -> RenderNode {
@@ -498,6 +707,71 @@ impl<'a> JsxLowerer<'a> {
             Some(value) => self.unsupported_attribute_value(value),
         }
         true
+    }
+
+    fn lower_component_attribute(
+        &mut self,
+        attribute: &JSXAttribute<'a>,
+        props: &mut Vec<RenderSourceProp>,
+        key: &mut Option<Expr>,
+    ) -> bool {
+        let name = self.jsx_attribute_name(&attribute.name);
+        if name == "key" {
+            *key = attribute
+                .value
+                .as_ref()
+                .and_then(|value| self.attribute_expr(value));
+            return true;
+        }
+        let span = Some(self.span(attribute.span));
+        match &attribute.value {
+            None => props.push(RenderSourceProp {
+                name,
+                value: CompactString::new(""),
+                template: None,
+                span,
+            }),
+            Some(JSXAttributeValue::StringLiteral(value)) => props.push(RenderSourceProp {
+                name,
+                value: CompactString::from(value.value.as_str()),
+                template: None,
+                span,
+            }),
+            Some(JSXAttributeValue::ExpressionContainer(container)) => {
+                let expr = self.lower_jsx_expression(&container.expression);
+                props.push(RenderSourceProp {
+                    name,
+                    value: CompactString::new(""),
+                    template: Some(TemplateString::new(
+                        self.source_for_span(container.span),
+                        vec![TemplateSegment::Expression(expr)],
+                        Some(self.span(container.span)),
+                    )),
+                    span,
+                });
+            }
+            Some(value) => self.unsupported_attribute_value(value),
+        }
+        true
+    }
+
+    fn push_spread_attribute(
+        &mut self,
+        attributes: &mut Vec<RenderAttribute>,
+        argument: &Expression<'a>,
+        span: OxcSpan,
+    ) {
+        let expr = self.lower_expression(argument);
+        attributes.push(RenderAttribute {
+            name: "{...}".into(),
+            value: CompactString::new(""),
+            template: Some(TemplateString::new(
+                self.source_for_span(argument.span()),
+                vec![TemplateSegment::Expression(expr)],
+                Some(self.span(argument.span())),
+            )),
+            span: Some(self.span(span)),
+        });
     }
 
     fn lower_style_attribute(
@@ -1076,6 +1350,154 @@ fn module_export_name(name: &ModuleExportName<'_>) -> Option<CompactString> {
         ModuleExportName::IdentifierReference(identifier) => Some(identifier.name.as_str().into()),
         ModuleExportName::StringLiteral(literal) => Some(literal.value.as_str().into()),
     }
+}
+
+fn component_identifier_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_uppercase() && chars.any(|ch| ch.is_ascii_lowercase()) && !name.contains('_')
+}
+
+fn component_reference_name(name: &str) -> CompactString {
+    name.strip_prefix("window.").unwrap_or(name).into()
+}
+
+fn function_body_contains_jsx(
+    body: &Option<oxc_allocator::Box<'_, FunctionBody<'_>>>,
+    source: &str,
+) -> bool {
+    body.as_deref()
+        .is_some_and(|body| function_body_statements_contain_jsx(body, source))
+}
+
+fn function_body_statements_contain_jsx(body: &FunctionBody<'_>, source: &str) -> bool {
+    body.statements
+        .iter()
+        .any(|statement| statement_contains_jsx(statement, source))
+}
+
+fn statement_contains_jsx(statement: &Statement<'_>, source: &str) -> bool {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            expression_contains_jsx(&statement.expression, source)
+        }
+        Statement::ReturnStatement(statement) => statement
+            .argument
+            .as_ref()
+            .is_some_and(|expression| expression_contains_jsx(expression, source)),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().any(|declarator| {
+                declarator
+                    .init
+                    .as_ref()
+                    .is_some_and(|expression| expression_contains_jsx(expression, source))
+            })
+        }
+        Statement::IfStatement(statement) => {
+            statement_contains_jsx(&statement.consequent, source)
+                || statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alternate| statement_contains_jsx(alternate, source))
+        }
+        Statement::BlockStatement(block) => block
+            .body
+            .iter()
+            .any(|statement| statement_contains_jsx(statement, source)),
+        _ => source
+            .get(statement.span().start as usize..statement.span().end as usize)
+            .is_some_and(|text| text.contains("</") || text.contains("<>")),
+    }
+}
+
+fn expression_contains_jsx(expression: &Expression<'_>, source: &str) -> bool {
+    match expression {
+        Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
+        Expression::ParenthesizedExpression(expression) => {
+            expression_contains_jsx(&expression.expression, source)
+        }
+        Expression::ArrowFunctionExpression(function) => {
+            function_body_statements_contain_jsx(&function.body, source)
+        }
+        Expression::CallExpression(call) => {
+            expression_contains_jsx(&call.callee, source)
+                || call
+                    .arguments
+                    .iter()
+                    .any(|argument| argument_contains_jsx(argument, source))
+        }
+        Expression::ObjectExpression(object) => object.properties.iter().any(|property| {
+            let ObjectPropertyKind::ObjectProperty(property) = property else {
+                return false;
+            };
+            expression_contains_jsx(&property.value, source)
+        }),
+        Expression::ArrayExpression(array) => array
+            .elements
+            .iter()
+            .any(|element| array_element_contains_jsx(element, source)),
+        Expression::ConditionalExpression(conditional) => {
+            expression_contains_jsx(&conditional.test, source)
+                || expression_contains_jsx(&conditional.consequent, source)
+                || expression_contains_jsx(&conditional.alternate, source)
+        }
+        Expression::LogicalExpression(logical) => {
+            expression_contains_jsx(&logical.left, source)
+                || expression_contains_jsx(&logical.right, source)
+        }
+        Expression::BinaryExpression(binary) => {
+            expression_contains_jsx(&binary.left, source)
+                || expression_contains_jsx(&binary.right, source)
+        }
+        _ => false,
+    }
+}
+
+fn argument_contains_jsx(argument: &Argument<'_>, source: &str) -> bool {
+    match argument {
+        Argument::JSXElement(_) | Argument::JSXFragment(_) => true,
+        Argument::ArrowFunctionExpression(function) => {
+            function_body_statements_contain_jsx(&function.body, source)
+        }
+        _ => false,
+    }
+}
+
+fn array_element_contains_jsx(element: &ArrayExpressionElement<'_>, source: &str) -> bool {
+    match element {
+        ArrayExpressionElement::JSXElement(_) | ArrayExpressionElement::JSXFragment(_) => true,
+        ArrayExpressionElement::SpreadElement(spread) => {
+            expression_contains_jsx(&spread.argument, source)
+        }
+        _ => false,
+    }
+}
+
+fn expression_is_window_publish(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::AssignmentExpression(assignment) => {
+            assignment_target_is_window_member(&assignment.left)
+        }
+        Expression::CallExpression(call) => call_is_object_assign_window(call),
+        _ => false,
+    }
+}
+
+fn call_is_object_assign_window(call: &CallExpression<'_>) -> bool {
+    let Expression::StaticMemberExpression(member) = &call.callee else {
+        return false;
+    };
+    if !matches!(&member.object, Expression::Identifier(identifier) if identifier.name.as_str() == "Object")
+        || member.property.name.as_str() != "assign"
+    {
+        return false;
+    }
+    matches!(
+        call.arguments.first(),
+        Some(Argument::Identifier(identifier)) if identifier.name.as_str() == "window"
+    )
 }
 
 fn argument_arrow_function<'b, 'a>(
