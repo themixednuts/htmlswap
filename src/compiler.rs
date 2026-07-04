@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use arcstr::ArcStr;
 
+use crate::adapter::AdapterArtifact;
+use crate::adapters::svelte::SvelteAdapterOptions;
 use crate::assets::CompileAssets;
 use crate::bundle::{BundleConfig, BundlePlan};
 use crate::css::{
@@ -62,6 +64,24 @@ impl Compiler {
             jobs,
             cache: None,
         })
+    }
+
+    #[must_use]
+    pub fn compile_jsx_svelte_project<I, N, S>(
+        &self,
+        sources: I,
+        options: SvelteAdapterOptions,
+    ) -> Compilation<AdapterArtifact>
+    where
+        I: IntoIterator<Item = (N, S)>,
+        N: Into<String>,
+        S: Into<ArcStr>,
+    {
+        let sources = sources
+            .into_iter()
+            .map(|(name, source)| jsx::JsxProjectSource::new(name, source))
+            .collect();
+        jsx::compile_svelte_project(sources, options)
     }
 
     #[must_use]

@@ -2125,6 +2125,14 @@ fn element_has_static_or_dynamic_style(element: &RenderElement) -> bool {
 
 fn jsx_component_placeholder_name(element: &RenderElement) -> Option<&str> {
     if element.source_tag == "jsx-component" {
+        if element
+            .source_intent
+            .as_deref()
+            .and_then(|intent| intent.component_source.as_ref())
+            .is_some()
+        {
+            return None;
+        }
         return element
             .source_intent
             .as_deref()

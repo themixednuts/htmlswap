@@ -3,6 +3,7 @@ use std::path::Path;
 
 use arcstr::ArcStr;
 use compact_str::CompactString;
+use heck::ToUpperCamelCase;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionExpression, AssignmentTarget,
@@ -17,6 +18,10 @@ use oxc_parser::{ParseOptions, Parser};
 use oxc_span::{GetSpan, SourceType, Span as OxcSpan};
 use oxc_syntax::operator::AssignmentOperator;
 
+use crate::adapter::{Adapter, AdapterArtifact, AdapterContext, ArtifactBuilder, GeneratedFile};
+use crate::adapters::svelte::{SvelteAdapter, SvelteAdapterOptions};
+use crate::bundle::{BundleConfig, BundlePlan};
+use crate::compiler::CompiledFragment;
 use crate::diagnostics::{Compilation, Diagnostic, Diagnostics};
 use crate::expr::{
     BindingPattern, Expr, ExprLiteral, ObjectEntry, TemplateSegment, TemplateString,
@@ -29,13 +34,32 @@ use crate::plan::{
     RenderSourceMount, RenderSourceProp, RenderSourceRef, RenderSourceSnippet, RenderSourceState,
     RenderText, UiRole,
 };
-use crate::source::{SourceId, Span};
+use crate::source::{SourceId, SourceKind, SourceMap, Span};
 use crate::style::StyleDeclaration;
 
 pub(crate) fn lower_jsx_module(
     source: &str,
     source_name: Option<&str>,
     source_id: SourceId,
+) -> Compilation<RenderPlan> {
+    lower_jsx_module_with_component(source, source_name, source_id, None, true)
+}
+
+fn lower_jsx_project_component_module(
+    source: &str,
+    source_name: Option<&str>,
+    source_id: SourceId,
+    component_name: &str,
+) -> Compilation<RenderPlan> {
+    lower_jsx_module_with_component(source, source_name, source_id, Some(component_name), false)
+}
+
+fn lower_jsx_module_with_component(
+    source: &str,
+    source_name: Option<&str>,
+    source_id: SourceId,
+    component_name: Option<&str>,
+    inline_published_components: bool,
 ) -> Compilation<RenderPlan> {
     let allocator = Allocator::default();
     let parser =
@@ -73,8 +97,9 @@ pub(crate) fn lower_jsx_module(
         source_aliases: BTreeMap::new(),
         inlined_component_items: Vec::new(),
         inlining_components: BTreeSet::new(),
+        inline_published_components,
     };
-    let plan = lowerer.lower_program(&parsed.program);
+    let plan = lowerer.lower_program(&parsed.program, component_name);
     Compilation::new(plan, lowerer.diagnostics)
 }
 
@@ -82,6 +107,991 @@ fn source_type_for(source_name: Option<&str>) -> SourceType {
     source_name
         .and_then(|name| SourceType::from_path(Path::new(name)).ok())
         .unwrap_or_else(SourceType::jsx)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JsxProjectSource {
+    pub name: String,
+    pub source: ArcStr,
+}
+
+impl JsxProjectSource {
+    pub(crate) fn new(name: impl Into<String>, source: impl Into<ArcStr>) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JsxProjectRegistry {
+    symbols: BTreeMap<CompactString, JsxProjectSymbol>,
+    modules: BTreeMap<usize, JsxProjectModule>,
+    diagnostics: Diagnostics,
+}
+
+#[derive(Debug, Clone)]
+struct JsxProjectModule {
+    path: String,
+    body: String,
+}
+
+#[derive(Debug, Clone)]
+struct JsxProjectSymbol {
+    name: CompactString,
+    source_index: usize,
+    output_name: CompactString,
+    kind: JsxProjectSymbolKind,
+}
+
+#[derive(Debug, Clone)]
+enum JsxProjectSymbolKind {
+    Component(JsxProjectComponentEmitter),
+    Value,
+    Alias(CompactString),
+}
+
+#[derive(Debug, Clone)]
+enum JsxProjectComponentEmitter {
+    Function { local_name: CompactString },
+    Synthetic { source: ArcStr },
+}
+
+#[derive(Debug, Clone)]
+struct JsxProjectLocal {
+    kind: JsxProjectLocalKind,
+}
+
+#[derive(Debug, Clone)]
+enum JsxProjectLocalKind {
+    Component(JsxProjectComponentEmitter),
+    Value,
+}
+
+#[derive(Debug, Clone)]
+struct JsxProjectPublish {
+    name: CompactString,
+    target: CompactString,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedComponentSymbol<'a> {
+    output_name: &'a str,
+}
+
+pub(crate) fn compile_svelte_project(
+    sources: Vec<JsxProjectSource>,
+    options: SvelteAdapterOptions,
+) -> Compilation<AdapterArtifact> {
+    let registry = scan_jsx_project(&sources);
+    let mut diagnostics = registry.diagnostics.clone();
+    let mut adapter_context = AdapterContext::new();
+    let mut artifact = ArtifactBuilder::new();
+
+    for module in registry.modules.values() {
+        artifact.add_file(
+            GeneratedFile::new(module.path.clone(), module.body.clone()),
+            &mut adapter_context,
+        );
+    }
+
+    for symbol in registry.component_symbols() {
+        let Some((source_name, source_text, requested_component)) =
+            project_component_source(&sources, symbol)
+        else {
+            diagnostics.push(Diagnostic::error(
+                format!("JSX project component `{}` has no source", symbol.name),
+                None,
+            ));
+            continue;
+        };
+        let mut source_map = SourceMap::new();
+        let source_id = source_map.add_file(
+            SourceKind::JavaScript,
+            Some(source_name),
+            source_text.clone(),
+        );
+        let mut lowered = lower_jsx_project_component_module(
+            source_text.as_str(),
+            source_map.file(source_id).and_then(|file| file.name()),
+            source_id,
+            requested_component.as_str(),
+        );
+        diagnostics.extend(lowered.diagnostics);
+        resolve_project_components(&mut lowered.value, &registry);
+
+        let fragment = CompiledFragment {
+            bundle: BundlePlan::from_render_plan_with_config(
+                &lowered.value,
+                &source_map,
+                &BundleConfig::default(),
+            ),
+            plan: lowered.value,
+            sources: source_map,
+        };
+        let output = SvelteAdapter::new(SvelteAdapterOptions {
+            component_name: symbol.output_name.clone(),
+            ..options.clone()
+        })
+        .adapt(&fragment, &mut adapter_context);
+        match output {
+            Ok(output) => {
+                for mut file in output.artifact.files {
+                    if file.path.ends_with(".svelte") {
+                        file.contents = rewrite_project_value_references(&file.contents, &registry);
+                    }
+                    artifact.add_file(file, &mut adapter_context);
+                }
+                for dependency in output.artifact.dependencies {
+                    artifact.add_dependency(dependency, &mut adapter_context);
+                }
+            }
+            Err(error) => diagnostics.push(Diagnostic::error(
+                format!(
+                    "Svelte adapter failed for JSX project component `{}`: {error}",
+                    symbol.name
+                ),
+                None,
+            )),
+        }
+    }
+
+    diagnostics.extend(adapter_context.into_diagnostics());
+    Compilation::new(artifact.finish(), diagnostics)
+}
+
+impl JsxProjectRegistry {
+    fn new() -> Self {
+        Self {
+            symbols: BTreeMap::new(),
+            modules: BTreeMap::new(),
+            diagnostics: Diagnostics::new(),
+        }
+    }
+
+    fn component_symbols(&self) -> Vec<&JsxProjectSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| matches!(symbol.kind, JsxProjectSymbolKind::Component(_)))
+            .collect()
+    }
+
+    fn value_symbols(&self) -> Vec<&JsxProjectSymbol> {
+        self.symbols
+            .values()
+            .filter(|symbol| matches!(symbol.kind, JsxProjectSymbolKind::Value))
+            .collect()
+    }
+
+    fn insert_symbol(&mut self, symbol: JsxProjectSymbol) {
+        if let Some(existing) = self.symbols.get(symbol.name.as_str()) {
+            if existing.source_index != symbol.source_index
+                || existing.output_name != symbol.output_name
+                || std::mem::discriminant(&existing.kind) != std::mem::discriminant(&symbol.kind)
+            {
+                self.diagnostics.push(Diagnostic::warning(
+                    format!(
+                        "JSX project symbol `{}` is published more than once; keeping first definition",
+                        symbol.name
+                    ),
+                    None,
+                ));
+            }
+            return;
+        }
+        self.symbols.insert(symbol.name.clone(), symbol);
+    }
+
+    fn resolve_component(&self, name: &str) -> Option<ResolvedComponentSymbol<'_>> {
+        let mut current = name;
+        let mut seen = BTreeSet::new();
+        loop {
+            if !seen.insert(current.to_owned()) {
+                return None;
+            }
+            let symbol = self.symbols.get(current)?;
+            match &symbol.kind {
+                JsxProjectSymbolKind::Component(_) => {
+                    return Some(ResolvedComponentSymbol {
+                        output_name: symbol.output_name.as_str(),
+                    });
+                }
+                JsxProjectSymbolKind::Alias(target) => {
+                    current = target.as_str();
+                }
+                JsxProjectSymbolKind::Value => return None,
+            }
+        }
+    }
+
+    fn module_for_value(&self, name: &str) -> Option<&str> {
+        let symbol = self.symbols.get(name)?;
+        if !matches!(symbol.kind, JsxProjectSymbolKind::Value) {
+            return None;
+        }
+        self.modules
+            .get(&symbol.source_index)
+            .map(|module| module.path.as_str())
+    }
+}
+
+fn scan_jsx_project(sources: &[JsxProjectSource]) -> JsxProjectRegistry {
+    let mut registry = JsxProjectRegistry::new();
+    for (source_index, source) in sources.iter().enumerate() {
+        scan_jsx_project_source(source_index, source, &mut registry);
+    }
+    registry
+}
+
+fn scan_jsx_project_source(
+    source_index: usize,
+    source: &JsxProjectSource,
+    registry: &mut JsxProjectRegistry,
+) {
+    let allocator = Allocator::default();
+    let parser = Parser::new(
+        &allocator,
+        source.source.as_str(),
+        source_type_for(Some(&source.name)),
+    )
+    .with_options(ParseOptions {
+        parse_regular_expression: true,
+        ..ParseOptions::default()
+    });
+    let parsed = parser.parse();
+    for diagnostic in parsed.diagnostics {
+        registry
+            .diagnostics
+            .push(Diagnostic::warning(diagnostic.to_string(), None));
+    }
+    if parsed.panicked {
+        registry.diagnostics.push(Diagnostic::error(
+            format!("JSX parser stopped early while scanning `{}`", source.name),
+            None,
+        ));
+        return;
+    }
+
+    let mut locals = BTreeMap::new();
+    collect_project_locals(source, source_index, &parsed.program, &mut locals, registry);
+    for (name, local) in &locals {
+        if let JsxProjectLocalKind::Component(emitter) = &local.kind {
+            registry.insert_symbol(JsxProjectSymbol {
+                name: name.clone(),
+                source_index,
+                output_name: project_component_name(name),
+                kind: JsxProjectSymbolKind::Component(emitter.clone()),
+            });
+        }
+    }
+
+    for publish in collect_project_publishes(source.source.as_str(), &parsed.program) {
+        if let Some(local) = locals.get(publish.target.as_str()) {
+            match &local.kind {
+                JsxProjectLocalKind::Component(emitter) => {
+                    if publish.name == publish.target {
+                        registry.insert_symbol(JsxProjectSymbol {
+                            name: publish.name,
+                            source_index,
+                            output_name: project_component_name(&publish.target),
+                            kind: JsxProjectSymbolKind::Component(emitter.clone()),
+                        });
+                    } else {
+                        registry.insert_symbol(JsxProjectSymbol {
+                            output_name: project_component_name(&publish.name),
+                            name: publish.name,
+                            source_index,
+                            kind: JsxProjectSymbolKind::Alias(publish.target),
+                        });
+                    }
+                }
+                JsxProjectLocalKind::Value => {
+                    registry.insert_symbol(JsxProjectSymbol {
+                        output_name: publish.name.clone(),
+                        name: publish.name,
+                        source_index,
+                        kind: JsxProjectSymbolKind::Value,
+                    });
+                }
+            }
+        } else if publish.name != publish.target {
+            registry.insert_symbol(JsxProjectSymbol {
+                output_name: project_component_name(&publish.name),
+                name: publish.name,
+                source_index,
+                kind: JsxProjectSymbolKind::Alias(publish.target),
+            });
+        }
+    }
+
+    collect_project_icon_extensions(source, source_index, registry);
+
+    if let Some(body) = emit_project_ts_module(source, &parsed.program, &locals) {
+        registry.modules.insert(
+            source_index,
+            JsxProjectModule {
+                path: project_module_path(&source.name),
+                body,
+            },
+        );
+    }
+}
+
+fn collect_project_locals(
+    source: &JsxProjectSource,
+    source_index: usize,
+    program: &Program<'_>,
+    locals: &mut BTreeMap<CompactString, JsxProjectLocal>,
+    registry: &mut JsxProjectRegistry,
+) {
+    for statement in &program.body {
+        match statement {
+            Statement::FunctionDeclaration(function) => {
+                let Some(id) = &function.id else {
+                    continue;
+                };
+                let name = CompactString::from(id.name.as_str());
+                let kind = if function_body_contains_jsx(&function.body, source.source.as_str()) {
+                    JsxProjectLocalKind::Component(JsxProjectComponentEmitter::Function {
+                        local_name: name.clone(),
+                    })
+                } else {
+                    JsxProjectLocalKind::Value
+                };
+                locals.insert(name, JsxProjectLocal { kind });
+            }
+            Statement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    let Some(name) = binding_identifier_name(&declarator.id) else {
+                        continue;
+                    };
+                    let mut local_kind = JsxProjectLocalKind::Value;
+                    if let Some(init) = &declarator.init {
+                        if let Some(emitter) =
+                            project_component_emitter_for_expression(source, name.as_str(), init)
+                        {
+                            local_kind = JsxProjectLocalKind::Component(emitter);
+                        }
+                        if let Expression::ObjectExpression(object) = init {
+                            collect_project_object_components(
+                                source,
+                                source_index,
+                                name.as_str(),
+                                object,
+                                locals,
+                                registry,
+                            );
+                        }
+                    }
+                    locals.insert(name, JsxProjectLocal { kind: local_kind });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_project_object_components(
+    source: &JsxProjectSource,
+    source_index: usize,
+    object_name: &str,
+    object: &ObjectExpression<'_>,
+    locals: &mut BTreeMap<CompactString, JsxProjectLocal>,
+    registry: &mut JsxProjectRegistry,
+) {
+    for property in &object.properties {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            continue;
+        };
+        let Some(key) = project_property_key(&property.key) else {
+            continue;
+        };
+        let public_name = CompactString::from(format!("{object_name}.{key}"));
+        let component_name = project_component_name(&public_name);
+        let Some(emitter) = project_component_emitter_for_expression(
+            source,
+            component_name.as_str(),
+            &property.value,
+        ) else {
+            continue;
+        };
+        locals.insert(
+            public_name.clone(),
+            JsxProjectLocal {
+                kind: JsxProjectLocalKind::Component(emitter.clone()),
+            },
+        );
+        registry.insert_symbol(JsxProjectSymbol {
+            name: public_name,
+            source_index,
+            output_name: component_name,
+            kind: JsxProjectSymbolKind::Component(emitter),
+        });
+    }
+}
+
+fn project_component_emitter_for_expression(
+    source: &JsxProjectSource,
+    component_name: &str,
+    expression: &Expression<'_>,
+) -> Option<JsxProjectComponentEmitter> {
+    if !expression_contains_jsx(expression, source.source.as_str()) {
+        return None;
+    }
+    let synthetic = match expression {
+        Expression::ArrowFunctionExpression(function) => {
+            synthetic_arrow_component_source(source.source.as_str(), component_name, function)?
+        }
+        Expression::FunctionExpression(function) => {
+            synthetic_function_component_source(source.source.as_str(), component_name, function)?
+        }
+        _ => return None,
+    };
+    Some(JsxProjectComponentEmitter::Synthetic {
+        source: ArcStr::from(synthetic),
+    })
+}
+
+fn collect_project_publishes(source: &str, program: &Program<'_>) -> Vec<JsxProjectPublish> {
+    let mut publishes = Vec::new();
+    for statement in &program.body {
+        collect_project_statement_publishes(source, statement, &mut publishes);
+    }
+    publishes
+}
+
+fn collect_project_statement_publishes(
+    source: &str,
+    statement: &Statement<'_>,
+    publishes: &mut Vec<JsxProjectPublish>,
+) {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            collect_project_expression_publishes(source, &statement.expression, publishes);
+        }
+        Statement::IfStatement(statement) => {
+            collect_project_statement_publishes(source, &statement.consequent, publishes);
+            if let Some(alternate) = &statement.alternate {
+                collect_project_statement_publishes(source, alternate, publishes);
+            }
+        }
+        Statement::BlockStatement(block) => {
+            for statement in &block.body {
+                collect_project_statement_publishes(source, statement, publishes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_project_expression_publishes(
+    source: &str,
+    expression: &Expression<'_>,
+    publishes: &mut Vec<JsxProjectPublish>,
+) {
+    match expression {
+        Expression::AssignmentExpression(assignment) => {
+            if assignment.operator != AssignmentOperator::Assign {
+                return;
+            }
+            let Some(name) = project_window_assignment_name(&assignment.left) else {
+                return;
+            };
+            let Some(target) = project_expression_reference_name(source, &assignment.right) else {
+                return;
+            };
+            publishes.push(JsxProjectPublish { name, target });
+        }
+        Expression::CallExpression(call) if call_is_object_assign_window(call) => {
+            let Some(Argument::ObjectExpression(object)) = call.arguments.get(1) else {
+                return;
+            };
+            for property in &object.properties {
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    continue;
+                };
+                let Some(name) = project_property_key(&property.key) else {
+                    continue;
+                };
+                let target = project_expression_reference_name(source, &property.value)
+                    .unwrap_or(name.clone());
+                publishes.push(JsxProjectPublish { name, target });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_project_icon_extensions(
+    source: &JsxProjectSource,
+    source_index: usize,
+    registry: &mut JsxProjectRegistry,
+) {
+    for line in source.source.lines() {
+        let Some(rest) = line.trim().strip_prefix("if (!I.") else {
+            continue;
+        };
+        let Some((icon, after_icon)) = rest.split_once(')') else {
+            continue;
+        };
+        let Some((_, after_mk)) = after_icon.split_once("mk(") else {
+            continue;
+        };
+        let Some(path) = first_js_string_literal(after_mk) else {
+            continue;
+        };
+        let public_name = CompactString::from(format!("Icon.{icon}"));
+        let component_name = project_component_name(&public_name);
+        let synthetic = format!(
+            "function {component_name}(p = {{}}) {{
+  return <svg width={{p.size || 12}} height={{p.size || 12}} viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" strokeWidth=\"2\" strokeLinecap=\"round\" strokeLinejoin=\"round\" {{...p}}>{path}</svg>;
+}}
+window.{component_name} = {component_name};
+"
+        );
+        registry.insert_symbol(JsxProjectSymbol {
+            name: public_name,
+            source_index,
+            output_name: component_name,
+            kind: JsxProjectSymbolKind::Component(JsxProjectComponentEmitter::Synthetic {
+                source: ArcStr::from(synthetic),
+            }),
+        });
+    }
+}
+
+fn emit_project_ts_module(
+    source: &JsxProjectSource,
+    program: &Program<'_>,
+    locals: &BTreeMap<CompactString, JsxProjectLocal>,
+) -> Option<String> {
+    let mut statements = Vec::new();
+    for statement in &program.body {
+        if project_statement_is_publish(statement)
+            || statement_contains_jsx(statement, source.source.as_str())
+            || project_statement_declares_component(statement, locals)
+        {
+            continue;
+        }
+        let text = source_for_oxc_span(source.source.as_str(), statement.span()).trim();
+        if text.is_empty() {
+            continue;
+        }
+        if matches!(statement, Statement::FunctionDeclaration(_)) {
+            statements.push(format!("export {text}"));
+        } else if matches!(statement, Statement::VariableDeclaration(_)) {
+            statements.push(format!("export {text}"));
+        }
+    }
+    (!statements.is_empty()).then(|| {
+        let mut body = statements.join("\n\n");
+        body.push('\n');
+        body
+    })
+}
+
+fn project_statement_declares_component(
+    statement: &Statement<'_>,
+    locals: &BTreeMap<CompactString, JsxProjectLocal>,
+) -> bool {
+    match statement {
+        Statement::FunctionDeclaration(function) => function.id.as_ref().is_some_and(|id| {
+            matches!(
+                locals.get(id.name.as_str()).map(|local| &local.kind),
+                Some(JsxProjectLocalKind::Component(_))
+            )
+        }),
+        Statement::VariableDeclaration(declaration) => {
+            declaration.declarations.iter().any(|declarator| {
+                binding_identifier_name(&declarator.id).is_some_and(|name| {
+                    matches!(
+                        locals.get(name.as_str()).map(|local| &local.kind),
+                        Some(JsxProjectLocalKind::Component(_))
+                    )
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+fn project_statement_is_publish(statement: &Statement<'_>) -> bool {
+    match statement {
+        Statement::ExpressionStatement(statement) => {
+            project_expression_is_publish(&statement.expression)
+        }
+        Statement::IfStatement(statement) => {
+            project_statement_is_publish(&statement.consequent)
+                || statement
+                    .alternate
+                    .as_ref()
+                    .is_some_and(|alternate| project_statement_is_publish(alternate))
+        }
+        _ => false,
+    }
+}
+
+fn project_expression_is_publish(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::AssignmentExpression(assignment) => {
+            assignment.operator == AssignmentOperator::Assign
+                && project_window_assignment_name(&assignment.left).is_some()
+        }
+        Expression::CallExpression(call) => call_is_object_assign_window(call),
+        _ => false,
+    }
+}
+
+fn project_component_source(
+    sources: &[JsxProjectSource],
+    symbol: &JsxProjectSymbol,
+) -> Option<(String, ArcStr, CompactString)> {
+    match &symbol.kind {
+        JsxProjectSymbolKind::Component(JsxProjectComponentEmitter::Function { local_name }) => {
+            let source = sources.get(symbol.source_index)?;
+            Some((
+                source.name.clone(),
+                source.source.clone(),
+                local_name.clone(),
+            ))
+        }
+        JsxProjectSymbolKind::Component(JsxProjectComponentEmitter::Synthetic { source }) => {
+            Some((
+                format!("{}.jsx", symbol.output_name),
+                source.clone(),
+                symbol.output_name.clone(),
+            ))
+        }
+        JsxProjectSymbolKind::Value | JsxProjectSymbolKind::Alias(_) => None,
+    }
+}
+
+fn resolve_project_components(plan: &mut RenderPlan, registry: &JsxProjectRegistry) {
+    for node in &mut plan.nodes {
+        resolve_project_component_node(node, registry);
+    }
+    for logic in &mut plan.source_logic {
+        let Some(component) = &mut logic.component else {
+            continue;
+        };
+        for item in &mut component.items {
+            let RenderSourceLogicItem::Snippet(snippet) = item else {
+                continue;
+            };
+            for node in &mut snippet.nodes {
+                resolve_project_component_node(node, registry);
+            }
+        }
+    }
+}
+
+fn resolve_project_component_node(node: &mut RenderNode, registry: &JsxProjectRegistry) {
+    let RenderNode::Element(element) = node else {
+        return;
+    };
+    if element.source_tag == "jsx-component"
+        && let Some(intent) = element.source_intent.as_deref_mut()
+        && let Some(component) = intent.component.as_ref()
+        && let Some(resolved) = registry.resolve_component(component.as_str())
+    {
+        intent.component = Some(ComponentId::new(resolved.output_name));
+        intent.component_source = Some(format!("./{}.svelte", resolved.output_name).into());
+    }
+    for child in &mut element.children {
+        resolve_project_component_node(child, registry);
+    }
+}
+
+fn rewrite_project_value_references(code: &str, registry: &JsxProjectRegistry) -> String {
+    let mut rewritten = code.to_owned();
+    let mut imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut values = registry.value_symbols();
+    values.sort_by(|left, right| right.name.len().cmp(&left.name.len()));
+    for symbol in values {
+        let name = symbol.name.as_str();
+        let needle = format!("window.{name}");
+        if !rewritten.contains(&needle) {
+            continue;
+        }
+        rewritten = rewritten.replace(&needle, name);
+        if let Some(module) = registry.module_for_value(name) {
+            imports
+                .entry(format!("./{module}"))
+                .or_default()
+                .insert(name.to_owned());
+        }
+    }
+    rewritten = rewrite_project_window_destructures(&rewritten, registry, &mut imports);
+    insert_svelte_project_imports(&rewritten, imports)
+}
+
+fn rewrite_project_window_destructures(
+    code: &str,
+    registry: &JsxProjectRegistry,
+    imports: &mut BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    let mut output = String::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        let destructured = trimmed
+            .strip_prefix("const {")
+            .and_then(|rest| rest.split_once("} = window"))
+            .map(|(names, _)| names);
+        let Some(names) = destructured else {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        };
+        let names = names
+            .split(',')
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        if names.is_empty()
+            || names.iter().any(|name| {
+                !registry.symbols.contains_key(*name)
+                    || matches!(
+                        registry.symbols.get(*name).map(|symbol| &symbol.kind),
+                        Some(JsxProjectSymbolKind::Alias(_))
+                    )
+            })
+        {
+            output.push_str(line);
+            output.push('\n');
+            continue;
+        }
+        for name in names {
+            if let Some(module) = registry.module_for_value(name) {
+                imports
+                    .entry(format!("./{module}"))
+                    .or_default()
+                    .insert(name.to_owned());
+            }
+        }
+    }
+    output
+}
+
+fn insert_svelte_project_imports(
+    code: &str,
+    imports: BTreeMap<String, BTreeSet<String>>,
+) -> String {
+    if imports.is_empty() {
+        return code.to_owned();
+    }
+    let import_block = imports
+        .into_iter()
+        .map(|(module, names)| {
+            format!(
+                "\timport {{ {} }} from {};",
+                names.into_iter().collect::<Vec<_>>().join(", "),
+                js_string_literal(&module)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let insert_after = code
+        .find("<script")
+        .and_then(|script| code[script..].find('\n').map(|offset| script + offset));
+    if let Some(position) = insert_after {
+        let mut output = String::with_capacity(code.len() + import_block.len() + 1);
+        output.push_str(&code[..=position]);
+        output.push_str(&import_block);
+        output.push('\n');
+        output.push_str(&code[position + 1..]);
+        output
+    } else {
+        format!("{import_block}\n{code}")
+    }
+}
+
+fn synthetic_arrow_component_source(
+    source: &str,
+    component_name: &str,
+    function: &ArrowFunctionExpression<'_>,
+) -> Option<String> {
+    let params = function
+        .params
+        .items
+        .iter()
+        .map(|param| {
+            source_for_oxc_span(source, param.pattern.span())
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = source_for_oxc_span(source, function.body.span()).trim();
+    let body = if function.expression {
+        format!("return ({body});")
+    } else {
+        trim_js_block(body).to_owned()
+    };
+    Some(format!(
+        "function {component_name}({params}) {{\n{body}\n}}\nwindow.{component_name} = {component_name};\n"
+    ))
+}
+
+fn synthetic_function_component_source(
+    source: &str,
+    component_name: &str,
+    function: &Function<'_>,
+) -> Option<String> {
+    let params = function
+        .params
+        .items
+        .iter()
+        .map(|param| {
+            source_for_oxc_span(source, param.pattern.span())
+                .trim()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = function
+        .body
+        .as_deref()
+        .map(|body| source_for_oxc_span(source, body.span()).trim())
+        .map(trim_js_block)?;
+    Some(format!(
+        "function {component_name}({params}) {{\n{body}\n}}\nwindow.{component_name} = {component_name};\n"
+    ))
+}
+
+fn trim_js_block(body: &str) -> &str {
+    body.trim()
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'))
+        .map(str::trim)
+        .unwrap_or(body)
+}
+
+fn project_window_assignment_name(target: &AssignmentTarget<'_>) -> Option<CompactString> {
+    let AssignmentTarget::StaticMemberExpression(member) = target else {
+        return None;
+    };
+    if !matches!(&member.object, Expression::Identifier(identifier) if identifier.name.as_str() == "window")
+    {
+        return None;
+    }
+    Some(member.property.name.as_str().into())
+}
+
+fn project_expression_reference_name(
+    source: &str,
+    expression: &Expression<'_>,
+) -> Option<CompactString> {
+    match expression {
+        Expression::Identifier(identifier) => Some(identifier.name.as_str().into()),
+        Expression::StaticMemberExpression(_) => {
+            let raw = source_for_oxc_span(source, expression.span()).trim();
+            raw.strip_prefix("window.")
+                .filter(|name| is_dotted_identifier(name))
+                .map(CompactString::from)
+        }
+        _ => None,
+    }
+}
+
+fn project_property_key(key: &PropertyKey<'_>) -> Option<CompactString> {
+    match key {
+        PropertyKey::StaticIdentifier(identifier) => Some(identifier.name.as_str().into()),
+        PropertyKey::StringLiteral(value) => Some(value.value.as_str().into()),
+        _ => None,
+    }
+}
+
+fn source_for_oxc_span(source: &str, span: OxcSpan) -> &str {
+    source
+        .get(span.start as usize..span.end as usize)
+        .unwrap_or_default()
+}
+
+fn project_component_name(name: &str) -> CompactString {
+    if name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        let mut output = String::with_capacity(name.len());
+        for (index, ch) in name.chars().enumerate() {
+            if index == 0 {
+                if ch.is_ascii_digit() {
+                    output.push('_');
+                    output.push(ch);
+                } else {
+                    output.push(ch.to_ascii_uppercase());
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        return output.into();
+    }
+    name.to_upper_camel_case().into()
+}
+
+fn project_module_path(source_name: &str) -> String {
+    let stem = source_name
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| {
+            name.strip_suffix(".jsx")
+                .or_else(|| name.strip_suffix(".tsx"))
+        })
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("module");
+    format!("{stem}.ts")
+}
+
+fn is_dotted_identifier(value: &str) -> bool {
+    value
+        .split('.')
+        .all(|part| is_simple_identifier(part) || component_identifier_name(part))
+}
+
+fn first_js_string_literal(source: &str) -> Option<String> {
+    let source = source.trim_start();
+    let quote = source.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut escaped = false;
+    let mut output = String::new();
+    for ch in source[quote.len_utf8()..].chars() {
+        if escaped {
+            output.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            output.push(ch);
+            continue;
+        }
+        if ch == quote {
+            return Some(output);
+        }
+        output.push(ch);
+    }
+    None
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '\'' => output.push_str("\\'"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            _ => output.push(ch),
+        }
+    }
+    output.push('\'');
+    output
 }
 
 struct JsxLowerer<'a> {
@@ -98,6 +1108,7 @@ struct JsxLowerer<'a> {
     source_aliases: BTreeMap<CompactString, CompactString>,
     inlined_component_items: Vec<RenderSourceLogicItem>,
     inlining_components: BTreeSet<CompactString>,
+    inline_published_components: bool,
 }
 
 struct JsxComponent<'a> {
@@ -117,13 +1128,20 @@ struct ComponentPropInit {
 }
 
 impl<'a> JsxLowerer<'a> {
-    fn lower_program(&mut self, program: &'a Program<'a>) -> RenderPlan {
+    fn lower_program(
+        &mut self,
+        program: &'a Program<'a>,
+        requested_component: Option<&str>,
+    ) -> RenderPlan {
         self.component_names = self.discover_component_names(program);
         self.function_components = self.discover_function_components(program);
         self.published_component_names = self.discover_published_component_names(program);
         self.inlined_component_items.clear();
         self.inlining_components.clear();
-        let Some(component) = self.find_component(program) else {
+        let component = requested_component
+            .and_then(|name| self.find_named_component(program, name))
+            .or_else(|| self.find_component(program));
+        let Some(component) = component else {
             let mut plan = RenderPlan::new(Vec::new());
             let prelude = self.module_source_logic_prelude(program, usize::MAX);
             if !prelude.trim().is_empty() || !self.component_names.is_empty() {
@@ -145,6 +1163,15 @@ impl<'a> JsxLowerer<'a> {
             ));
             return plan;
         };
+        if let Some(requested_component) = requested_component
+            && component.name != requested_component
+        {
+            self.diagnostics.push(Diagnostic::error(
+                format!("JSX component `{requested_component}` was not found"),
+                None,
+            ));
+            return RenderPlan::new(Vec::new());
+        }
         let Some(body) = component.function.body.as_deref() else {
             self.diagnostics.push(Diagnostic::error(
                 format!("JSX component `{}` has no body", component.name),
@@ -331,6 +1358,19 @@ impl<'a> JsxLowerer<'a> {
         }
 
         self.find_exported_component(program)
+    }
+
+    fn find_named_component(
+        &self,
+        program: &'a Program<'a>,
+        name: &str,
+    ) -> Option<JsxComponent<'a>> {
+        self.find_function_declaration(program, name)
+            .map(|function| JsxComponent {
+                name: name.into(),
+                function,
+                module_end: function.span.start as usize,
+            })
     }
 
     fn find_window_component_name(&self, program: &Program<'a>) -> Option<CompactString> {
@@ -1264,6 +2304,9 @@ return groups;"
             wrapper.children = children;
             return (RenderNode::Element(Box::new(wrapper)), key);
         }
+        if self.snippets.contains(tag.as_str()) {
+            return (self.lower_snippet_element(tag.as_str(), element), None);
+        }
         if is_jsx_component_tag(&tag) {
             return self.lower_component_element(&tag, element);
         }
@@ -1324,6 +2367,9 @@ return groups;"
         tag: &str,
         element: &JSXElement<'a>,
     ) -> Option<(RenderNode, Option<Expr>)> {
+        if !self.inline_published_components {
+            return None;
+        }
         if tag.contains('.') || !self.published_component_names.contains(tag) {
             return None;
         }
@@ -1983,6 +3029,26 @@ return groups;"
             span: Some(self.span(call.span)),
         });
         Some(RenderNode::Element(Box::new(render)))
+    }
+
+    fn lower_snippet_element(&mut self, tag: &str, element: &JSXElement<'a>) -> RenderNode {
+        let mut render = self.empty_element("jsx-render", element.span);
+        let props = self.component_call_props(element).unwrap_or_default();
+        let arguments = props
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {value}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        render.attributes.push(RenderAttribute {
+            name: "data-htmlswap-render".into(),
+            value: format!("{tag}({{ {arguments} }})").into(),
+            template: None,
+            span: Some(self.span(element.span)),
+        });
+        render
+            .children
+            .extend(self.lower_children(&element.children));
+        RenderNode::Element(Box::new(render))
     }
 
     fn lower_flat_map_call(&mut self, call: &CallExpression<'a>) -> Option<RenderNode> {

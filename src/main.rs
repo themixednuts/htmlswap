@@ -190,6 +190,16 @@ impl CompileCommand {
     }
 
     fn compile_once(&self, compiler: &Compiler) -> Result<(), CliError> {
+        if self.source == SourceFrontendKindArg::Jsx
+            && self.adapter == AdapterKind::Svelte
+            && let Some(input_path) = self.input_path()
+            && input_path.is_dir()
+        {
+            let artifact = self.render_jsx_svelte_project(compiler, input_path)?;
+            self.write_artifact(&artifact)?;
+            return Ok(());
+        }
+
         let source = self.read_input()?;
         let assets = self.read_assets()?;
         let source_name = self.input_path().map(source_name_for_path);
@@ -215,6 +225,20 @@ impl CompileCommand {
         };
         self.write_artifact(&artifact)?;
         Ok(())
+    }
+
+    fn render_jsx_svelte_project(
+        &self,
+        compiler: &Compiler,
+        input_path: &Path,
+    ) -> Result<AdapterArtifact, CliError> {
+        let mut sources = Vec::new();
+        for path in jsx_project_input_paths(input_path)? {
+            sources.push((source_name_for_path(&path), read_to_string(&path)?));
+        }
+        let compiled = compiler.compile_jsx_svelte_project(sources, self.svelte_options());
+        print_diagnostics(&compiled.diagnostics, &SourceMap::new());
+        Ok(compiled.value)
     }
 
     fn render(&self, fragment: &CompiledFragment) -> Result<AdapterArtifact, CliError> {
@@ -939,6 +963,39 @@ fn resolve_dc_component_path(root_dir: &Path, component: &str) -> Result<PathBuf
         component: component.to_owned(),
         root: root_dir.to_path_buf(),
     })
+}
+
+fn jsx_project_input_paths(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let mut paths = Vec::new();
+    let entries = std::fs::read_dir(root).map_err(|source| CliError::Read {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::Read {
+            path: root.to_path_buf(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsx") {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "design-canvas.jsx" | "tweaks-panel.jsx" | "theme-tweaks.jsx"
+                )
+            })
+        {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 fn normalize_component_path(path: &Path) -> PathBuf {
