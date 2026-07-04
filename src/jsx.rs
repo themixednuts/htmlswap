@@ -432,9 +432,21 @@ impl<'a> JsxLowerer<'a> {
             }
             Expression::JSXElement(element) => vec![self.lower_jsx_element(element).0],
             Expression::JSXFragment(fragment) => self.lower_jsx_fragment(fragment),
+            Expression::ConditionalExpression(conditional) => self
+                .lower_conditional_child(
+                    &conditional.test,
+                    &conditional.consequent,
+                    &conditional.alternate,
+                    conditional.span,
+                )
+                .unwrap_or_default(),
+            Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => self
+                .lower_expression_child_expression(expression)
+                .unwrap_or_default(),
+            Expression::NullLiteral(_) => Vec::new(),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
-                    "Phase 0 JSX components must return a JSX element or fragment",
+                    "Phase 3 JSX components must return JSX, a JSX conditional, or null",
                     Some(self.span(expression.span())),
                 ));
                 Vec::new()
@@ -878,13 +890,13 @@ impl<'a> JsxLowerer<'a> {
                     }
                 }
                 JSXChild::ExpressionContainer(container) => {
-                    if let Some(node) = self.lower_expression_child(container) {
+                    if let Some(children) = self.lower_expression_child(container) {
                         flush_text(
                             &mut nodes,
                             &mut text_segments,
                             Some(self.span(container.span)),
                         );
-                        nodes.push(node);
+                        nodes.extend(children);
                     } else if !matches!(container.expression, JSXExpression::EmptyExpression(_)) {
                         text_segments.push(TemplateSegment::Expression(
                             self.lower_jsx_expression(&container.expression),
@@ -922,16 +934,184 @@ impl<'a> JsxLowerer<'a> {
     fn lower_expression_child(
         &mut self,
         container: &JSXExpressionContainer<'a>,
-    ) -> Option<RenderNode> {
-        match &container.expression {
-            JSXExpression::CallExpression(call) => self.lower_map_call(call),
-            JSXExpression::JSXElement(element) => Some(self.lower_jsx_element(element).0),
-            JSXExpression::ParenthesizedExpression(expression) => match &expression.expression {
-                Expression::JSXElement(element) => Some(self.lower_jsx_element(element).0),
-                _ => None,
-            },
+    ) -> Option<Vec<RenderNode>> {
+        self.lower_jsx_expression_child(&container.expression)
+    }
+
+    fn lower_jsx_expression_child(
+        &mut self,
+        expression: &JSXExpression<'a>,
+    ) -> Option<Vec<RenderNode>> {
+        match expression {
+            JSXExpression::CallExpression(call) => self.lower_call_child(call),
+            JSXExpression::JSXElement(element) => Some(vec![self.lower_jsx_element(element).0]),
+            JSXExpression::JSXFragment(fragment) => Some(self.lower_jsx_fragment(fragment)),
+            JSXExpression::ParenthesizedExpression(expression) => {
+                self.lower_expression_child_expression(&expression.expression)
+            }
+            JSXExpression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => {
+                let children = self.lower_expression_child_expression(&logical.right)?;
+                let condition = self.lower_expression(&logical.left);
+                Some(vec![self.control_flow_wrapper(
+                    RenderControlFlowKind::If,
+                    Some(condition),
+                    logical.span,
+                    children,
+                    Vec::new(),
+                )])
+            }
+            JSXExpression::ConditionalExpression(conditional) => self.lower_conditional_child(
+                &conditional.test,
+                &conditional.consequent,
+                &conditional.alternate,
+                conditional.span,
+            ),
+            JSXExpression::NullLiteral(_) => Some(Vec::new()),
             _ => None,
         }
+    }
+
+    fn lower_expression_child_expression(
+        &mut self,
+        expression: &Expression<'a>,
+    ) -> Option<Vec<RenderNode>> {
+        match expression {
+            Expression::CallExpression(call) => self.lower_call_child(call),
+            Expression::JSXElement(element) => Some(vec![self.lower_jsx_element(element).0]),
+            Expression::JSXFragment(fragment) => Some(self.lower_jsx_fragment(fragment)),
+            Expression::ParenthesizedExpression(expression) => {
+                self.lower_expression_child_expression(&expression.expression)
+            }
+            Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => {
+                let children = self.lower_expression_child_expression(&logical.right)?;
+                let condition = self.lower_expression(&logical.left);
+                Some(vec![self.control_flow_wrapper(
+                    RenderControlFlowKind::If,
+                    Some(condition),
+                    logical.span,
+                    children,
+                    Vec::new(),
+                )])
+            }
+            Expression::ConditionalExpression(conditional) => self.lower_conditional_child(
+                &conditional.test,
+                &conditional.consequent,
+                &conditional.alternate,
+                conditional.span,
+            ),
+            Expression::NullLiteral(_) => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
+    fn lower_call_child(&mut self, call: &CallExpression<'a>) -> Option<Vec<RenderNode>> {
+        if let Some(node) = self.lower_map_call(call) {
+            return Some(vec![node]);
+        }
+        self.lower_iife_call(call)
+    }
+
+    fn lower_conditional_child(
+        &mut self,
+        test: &Expression<'a>,
+        consequent: &Expression<'a>,
+        alternate: &Expression<'a>,
+        span: OxcSpan,
+    ) -> Option<Vec<RenderNode>> {
+        let consequent_nodes = self.lower_expression_child_expression(consequent)?;
+        let alternate_nodes = self.lower_expression_child_expression(alternate)?;
+        if consequent_nodes.is_empty() && alternate_nodes.is_empty() {
+            return Some(Vec::new());
+        }
+        if consequent_nodes.is_empty() {
+            return Some(vec![self.control_flow_wrapper(
+                RenderControlFlowKind::If,
+                Some(Expr::Opaque(
+                    format!("!({})", self.source_for_span(test.span())).into(),
+                )),
+                span,
+                alternate_nodes,
+                Vec::new(),
+            )]);
+        }
+
+        let condition = self.lower_expression(test);
+        let mut nodes = vec![self.control_flow_wrapper(
+            RenderControlFlowKind::If,
+            Some(condition),
+            span,
+            consequent_nodes,
+            Vec::new(),
+        )];
+        if !alternate_nodes.is_empty() {
+            nodes.push(self.control_flow_wrapper(
+                RenderControlFlowKind::Else,
+                None,
+                alternate.span(),
+                alternate_nodes,
+                Vec::new(),
+            ));
+        }
+        Some(nodes)
+    }
+
+    fn lower_iife_call(&mut self, call: &CallExpression<'a>) -> Option<Vec<RenderNode>> {
+        if !call.arguments.is_empty() {
+            return None;
+        }
+        let callback = match &call.callee {
+            Expression::ArrowFunctionExpression(callback) => callback,
+            Expression::ParenthesizedExpression(expression) => {
+                let Expression::ArrowFunctionExpression(callback) = &expression.expression else {
+                    return None;
+                };
+                callback
+            }
+            _ => return None,
+        };
+        let locals = self.callback_locals(callback);
+        let return_expression = returned_expression(&callback.body)?;
+        let children = self.lower_return_expression(return_expression);
+        if locals.is_empty() {
+            return Some(children);
+        }
+        Some(vec![self.control_flow_wrapper(
+            RenderControlFlowKind::If,
+            Some(Expr::Literal(ExprLiteral::Bool(true))),
+            call.span,
+            children,
+            locals,
+        )])
+    }
+
+    fn control_flow_wrapper(
+        &self,
+        kind: RenderControlFlowKind,
+        expression: Option<Expr>,
+        span: OxcSpan,
+        children: Vec<RenderNode>,
+        locals: Vec<RenderLoopLocal>,
+    ) -> RenderNode {
+        let tag = match kind {
+            RenderControlFlowKind::If => "jsx-if",
+            RenderControlFlowKind::ElseIf => "jsx-else-if",
+            RenderControlFlowKind::Else => "jsx-else",
+            _ => "jsx-flow",
+        };
+        let mut wrapper = self.empty_element(tag, span);
+        wrapper.control_flow = Some(Box::new(RenderControlFlow {
+            kind,
+            host: RenderControlFlowHost::Wrapper,
+            expression,
+            binding: None,
+            index_binding: None,
+            key: None,
+            locals,
+            placeholder: None,
+            span: Some(self.span(span)),
+        }));
+        wrapper.children = children;
+        RenderNode::Element(Box::new(wrapper))
     }
 
     fn lower_map_call(&mut self, call: &CallExpression<'a>) -> Option<RenderNode> {
@@ -974,14 +1154,13 @@ impl<'a> JsxLowerer<'a> {
             .and_then(|param| self.callback_binding(&param.pattern));
         let list_expr = self.lower_expression(&member.object);
         let locals = self.callback_locals(callback);
-        let Some(return_expression) = returned_expression(&callback.body) else {
+        let Some((children, key)) = self.lower_map_callback_children(callback) else {
             self.diagnostics.push(Diagnostic::error(
                 "JSX .map(...) callback must return JSX in Phase 0",
                 Some(self.span(callback.body.span)),
             ));
             return None;
         };
-        let (children, key) = self.lower_map_return(return_expression);
         let mut wrapper = self.empty_element("jsx-each", call.span);
         wrapper.control_flow = Some(Box::new(RenderControlFlow {
             kind: RenderControlFlowKind::For,
@@ -998,6 +1177,92 @@ impl<'a> JsxLowerer<'a> {
         Some(RenderNode::Element(Box::new(wrapper)))
     }
 
+    fn lower_map_callback_children(
+        &mut self,
+        callback: &ArrowFunctionExpression<'a>,
+    ) -> Option<(Vec<RenderNode>, Option<Expr>)> {
+        let mut branches = Vec::new();
+        for statement in &callback.body.statements {
+            match statement {
+                Statement::IfStatement(statement) => {
+                    if let Some(branch) =
+                        self.lower_if_return_branch(statement, branches.is_empty())
+                    {
+                        branches.extend(branch);
+                    }
+                }
+                Statement::ReturnStatement(statement) => {
+                    let expression = statement.argument.as_ref()?;
+                    if branches.is_empty() {
+                        return Some(self.lower_map_return(expression));
+                    }
+                    let (children, key) = self.lower_map_return(expression);
+                    if !children.is_empty() {
+                        branches.push(self.control_flow_wrapper(
+                            RenderControlFlowKind::Else,
+                            None,
+                            statement.span,
+                            children,
+                            Vec::new(),
+                        ));
+                    }
+                    return Some((branches, key));
+                }
+                _ => {}
+            }
+        }
+        let expression = returned_expression(&callback.body)?;
+        Some(self.lower_map_return(expression))
+    }
+
+    fn lower_if_return_branch(
+        &mut self,
+        statement: &oxc_ast::ast::IfStatement<'a>,
+        first: bool,
+    ) -> Option<Vec<RenderNode>> {
+        let expression = return_expression_from_statement(&statement.consequent)?;
+        let children = self.lower_map_return(expression).0;
+        if children.is_empty() {
+            return None;
+        }
+        let condition = self.lower_expression(&statement.test);
+        let mut nodes = vec![self.control_flow_wrapper(
+            if first {
+                RenderControlFlowKind::If
+            } else {
+                RenderControlFlowKind::ElseIf
+            },
+            Some(condition),
+            statement.span,
+            children,
+            Vec::new(),
+        )];
+        if let Some(alternate) = &statement.alternate {
+            match alternate {
+                Statement::IfStatement(alternate) => {
+                    if let Some(branch) = self.lower_if_return_branch(alternate, false) {
+                        nodes.extend(branch);
+                    }
+                }
+                _ => {
+                    if let Some(expression) = return_expression_from_statement(alternate) {
+                        let children = self.lower_map_return(expression).0;
+                        if !children.is_empty() {
+                            nodes.push(self.control_flow_wrapper(
+                                RenderControlFlowKind::Else,
+                                None,
+                                alternate.span(),
+                                children,
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Some(nodes)
+    }
+
     fn lower_map_return(&mut self, expression: &Expression<'a>) -> (Vec<RenderNode>, Option<Expr>) {
         match expression {
             Expression::ParenthesizedExpression(expression) => {
@@ -1008,9 +1273,25 @@ impl<'a> JsxLowerer<'a> {
                 (vec![node], key)
             }
             Expression::JSXFragment(fragment) => (self.lower_jsx_fragment(fragment), None),
+            Expression::ConditionalExpression(conditional) => (
+                self.lower_conditional_child(
+                    &conditional.test,
+                    &conditional.consequent,
+                    &conditional.alternate,
+                    conditional.span,
+                )
+                .unwrap_or_default(),
+                None,
+            ),
+            Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => (
+                self.lower_expression_child_expression(expression)
+                    .unwrap_or_default(),
+                None,
+            ),
+            Expression::NullLiteral(_) => (Vec::new(), None),
             _ => {
                 self.diagnostics.push(Diagnostic::error(
-                    "JSX .map(...) callback must return JSX in Phase 0",
+                    "JSX .map(...) callback must return JSX, a JSX conditional, or null in Phase 3",
                     Some(self.span(expression.span())),
                 ));
                 (Vec::new(), None)
@@ -1028,13 +1309,9 @@ impl<'a> JsxLowerer<'a> {
                 continue;
             };
             for declarator in &declaration.declarations {
-                let Some(name) = binding_identifier_name(&declarator.id) else {
-                    self.diagnostics.push(Diagnostic::error(
-                        "destructured .map(...) callback locals are outside Phase 0 scope",
-                        Some(self.span(declarator.span)),
-                    ));
-                    continue;
-                };
+                let name = binding_identifier_name(&declarator.id).unwrap_or_else(|| {
+                    CompactString::from(self.source_for_span(declarator.id.span()).trim())
+                });
                 let Some(init) = &declarator.init else {
                     continue;
                 };
@@ -1332,9 +1609,28 @@ fn returned_expression<'b, 'a>(body: &'b FunctionBody<'a>) -> Option<&'b Express
         .iter()
         .find_map(|statement| match statement {
             Statement::ReturnStatement(statement) => statement.argument.as_ref(),
-            Statement::ExpressionStatement(statement) => Some(&statement.expression),
             _ => None,
         })
+        .or_else(|| {
+            body.statements
+                .iter()
+                .find_map(|statement| match statement {
+                    Statement::ExpressionStatement(statement) => Some(&statement.expression),
+                    _ => None,
+                })
+        })
+}
+
+fn return_expression_from_statement<'b, 'a>(
+    statement: &'b Statement<'a>,
+) -> Option<&'b Expression<'a>> {
+    match statement {
+        Statement::ReturnStatement(statement) => statement.argument.as_ref(),
+        Statement::BlockStatement(block) => {
+            block.body.iter().find_map(return_expression_from_statement)
+        }
+        _ => None,
+    }
 }
 
 fn assignment_target_is_window_member(target: &AssignmentTarget<'_>) -> bool {
@@ -2050,7 +2346,7 @@ fn role_for_tag(tag: &str) -> UiRole {
         "fieldset" => UiRole::Fieldset,
         "legend" => UiRole::Legend,
         "label" => UiRole::Label,
-        "jsx-each" => UiRole::Unknown,
+        "jsx-each" | "jsx-if" | "jsx-else-if" | "jsx-else" | "jsx-flow" => UiRole::Unknown,
         _ => UiRole::Container,
     }
 }

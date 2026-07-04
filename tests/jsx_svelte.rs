@@ -187,6 +187,10 @@ window.Demo = Demo;
         "{code}"
     );
     assert!(!code.contains("<Icon.search"), "{code}");
+    assert!(
+        !code.contains("htmlswap-jsx-component-placeholder"),
+        "{code}"
+    );
 }
 
 #[test]
@@ -204,4 +208,58 @@ window.Demo = Demo;
     assert!(code.contains("<span>"), "{code}");
     assert!(!code.contains("React.Fragment"), "{code}");
     assert!(!code.contains("jsx-fragment"), "{code}");
+}
+
+#[test]
+fn lowers_logical_and_ternary_jsx_branches_to_if_blocks() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo() {
+  const active = true;
+  const mode = 'a';
+  return <div>{active && <span>A</span>}{mode === 'a' ? <b>B</b> : <i>I</i>}</div>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    assert!(code.contains("{#if active}"), "{code}");
+    assert!(code.contains("{#if mode === \"a\"}"), "{code}");
+    assert!(code.contains("{:else}"), "{code}");
+    assert!(!code.contains("&& <"), "{code}");
+}
+
+#[test]
+fn lowers_map_callbacks_with_early_returns_to_if_else_chains() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo() {
+  const toks = [{ t: 'br' }, { t: 'id', v: 'x' }];
+  return <code>{toks.map((t, i) => { if (t.t === 'br') return <br key={i} />; return <span key={i}>{t.v}</span>; })}</code>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    assert!(code.contains("{#each toks as t, i (i)}"), "{code}");
+    assert!(code.contains("{#if t.t === \"br\"}"), "{code}");
+    assert!(code.contains("{:else}"), "{code}");
+    assert!(code.contains("<br />"), "{code}");
+}
+
+#[test]
+fn lowers_iife_jsx_returns_with_const_locals() {
+    let code = emit_svelte_jsx(
+        r#"
+function Demo() {
+  return <svg>{(() => { const x = 1; const y = x + 1; return <text x={x} y={y}>T</text>; })()}</svg>;
+}
+window.Demo = Demo;
+"#,
+    );
+
+    assert!(code.contains("{#if true}"), "{code}");
+    assert!(code.contains("{@const x = 1}"), "{code}");
+    assert!(code.contains("{@const y = x + 1}"), "{code}");
+    assert!(!code.contains("return <text"), "{code}");
 }

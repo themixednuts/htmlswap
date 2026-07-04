@@ -219,8 +219,10 @@ impl SveltePrelude {
         let mut fallback = self.stylesheet_rules.len();
         loop {
             let key = StyleRuleOrderKey::new(span, fallback);
-            if !self.stylesheet_rules.contains_key(&key) {
-                self.stylesheet_rules.insert(key, rule_text);
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.stylesheet_rules.entry(key)
+            {
+                entry.insert(rule_text);
                 break;
             }
             fallback += 1;
@@ -332,6 +334,27 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         }
         let scope =
             scope_for_control_flow(element.control_flow.as_deref(), scope, &mut self.prelude);
+        if let Some(control_flow) = element.control_flow.as_deref()
+            && let Some(expression) = &control_flow.expression
+        {
+            self.collect_expr_props(
+                expression,
+                &scope,
+                control_flow.kind == RenderControlFlowKind::For,
+            );
+        }
+        let mut element_scope = scope.clone();
+        if let Some(control_flow) = element.control_flow.as_deref() {
+            if let Some(key) = &control_flow.key {
+                self.collect_expr_props(key, &scope, false);
+            }
+            for local in &control_flow.locals {
+                self.collect_expr_props(&local.value, &element_scope, false);
+                for name in binding_pattern_locals(&local.name) {
+                    element_scope = element_scope.with_local(name);
+                }
+            }
+        }
         self.collect_browser_only_style_diagnostics(element);
         let emits_dom_node = element_emits_dom_node(element);
         if emits_dom_node {
@@ -349,49 +372,30 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             self.prelude.snippet_prop(slot_prop_name(element));
         }
         if let Some(source_intent) = element.source_intent.as_deref() {
-            self.collect_source_intent(element, source_intent, &scope);
+            self.collect_source_intent(element, source_intent, &element_scope);
         }
         for attribute in &element.attributes {
             if attribute.name == "data-htmlswap-attach" {
                 self.prelude.uses_attachment = true;
                 for root in loose_expression_roots(&attribute.value) {
-                    if !scope.is_local(&root) && !self.prelude.states.contains_key(&root) {
+                    if !element_scope.is_local(&root) && !self.prelude.states.contains_key(&root) {
                         self.prelude.prop(root);
                     }
                 }
             }
             if let Some(template) = &attribute.template {
-                self.collect_template_props(template, &scope);
+                self.collect_template_props(template, &element_scope);
             }
         }
         for style in &element.dynamic_styles {
             self.prelude.uses_style_helper = true;
-            self.collect_template_props(&style.expression, &scope);
+            self.collect_template_props(&style.expression, &element_scope);
         }
         for action in &element.actions {
-            self.collect_action_props(action, &scope);
-        }
-        if let Some(control_flow) = element.control_flow.as_deref()
-            && let Some(expression) = &control_flow.expression
-        {
-            self.collect_expr_props(
-                expression,
-                &scope,
-                control_flow.kind == RenderControlFlowKind::For,
-            );
-        }
-        if let Some(control_flow) = element.control_flow.as_deref() {
-            if let Some(key) = &control_flow.key {
-                self.collect_expr_props(key, &scope, false);
-            }
-            let mut local_scope = scope.clone();
-            for local in &control_flow.locals {
-                self.collect_expr_props(&local.value, &local_scope, false);
-                local_scope = local_scope.with_local(sanitize_js_identifier(&local.name, "local"));
-            }
+            self.collect_action_props(action, &element_scope);
         }
         for (index, child) in element.children.iter().enumerate() {
-            self.collect_node(child, &scope, &format!("{path}_{index}"));
+            self.collect_node(child, &element_scope, &format!("{path}_{index}"));
         }
     }
 
@@ -1193,8 +1197,9 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
                 _ if first => break,
                 _ => break,
             }
-            let inner_scope =
+            let mut inner_scope =
                 scope_for_control_flow(Some(control_flow), scope, &mut SveltePrelude::default());
+            self.write_control_flow_locals(output, control_flow, depth + 1, &mut inner_scope);
             self.write_element_or_wrapper(
                 output,
                 element,
@@ -1262,19 +1267,32 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
         if let Some(index_binding) = index_binding {
             inner_scope = inner_scope.with_local(index_binding);
         }
+        self.write_control_flow_locals(output, control_flow, depth + 1, &mut inner_scope);
+        self.write_element_or_wrapper(output, element, depth + 1, &inner_scope, path, true);
+        writeln!(output, "{}{{/each}}", indent(depth)).expect("writing to String cannot fail");
+    }
+
+    fn write_control_flow_locals(
+        &self,
+        output: &mut String,
+        control_flow: &RenderControlFlow,
+        depth: usize,
+        scope: &mut Scope,
+    ) {
         for local in &control_flow.locals {
+            let pattern = svelte_binding_pattern(&local.name);
             writeln!(
                 output,
                 "{}{{@const {} = {}}}",
-                indent(depth + 1),
-                sanitize_js_identifier(&local.name, "local"),
+                indent(depth),
+                pattern,
                 svelte_expr(&local.value)
             )
             .expect("writing to String cannot fail");
-            inner_scope = inner_scope.with_local(sanitize_js_identifier(&local.name, "local"));
+            for name in binding_pattern_locals(&local.name) {
+                *scope = scope.clone().with_local(name);
+            }
         }
-        self.write_element_or_wrapper(output, element, depth + 1, &inner_scope, path, true);
-        writeln!(output, "{}{{/each}}", indent(depth)).expect("writing to String cannot fail");
     }
 
     fn write_control_flow_as_if(
@@ -1292,7 +1310,11 @@ impl<'a, 'cx> SvelteEmitter<'a, 'cx> {
             .map(svelte_expr)
             .unwrap_or_else(|| "true".to_owned());
         writeln!(output, "{}{{#if {expr}}}", indent(depth)).expect("writing to String cannot fail");
-        self.write_element_or_wrapper(output, element, depth + 1, scope, path, true);
+        let mut inner_scope = scope.clone();
+        if let Some(control_flow) = element.control_flow.as_deref() {
+            self.write_control_flow_locals(output, control_flow, depth + 1, &mut inner_scope);
+        }
+        self.write_element_or_wrapper(output, element, depth + 1, &inner_scope, path, true);
         writeln!(output, "{}{{/if}}", indent(depth)).expect("writing to String cannot fail");
     }
 
@@ -2591,15 +2613,254 @@ fn jsx_source_logic_declares(logic: &RenderSourceLogic, name: &str) -> bool {
         return true;
     }
     let body = logic.body.as_str();
-    [
-        format!("const {name}"),
-        format!("let {name}"),
-        format!("var {name}"),
-        format!("function {name}"),
-        format!("class {name}"),
-    ]
-    .iter()
-    .any(|needle| body.contains(needle))
+    jsx_source_logic_declared_names(body).contains(name)
+        || body.contains(&format!(", {name} ="))
+        || body.contains(&format!(" {name} ="))
+}
+
+fn jsx_source_logic_declared_names(body: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_jsx_named_declaration_names(body, "function", &mut names);
+    collect_jsx_named_declaration_names(body, "class", &mut names);
+    collect_jsx_variable_declaration_names(body, "const", &mut names);
+    collect_jsx_variable_declaration_names(body, "let", &mut names);
+    collect_jsx_variable_declaration_names(body, "var", &mut names);
+    names
+}
+
+fn collect_jsx_named_declaration_names(body: &str, keyword: &str, names: &mut BTreeSet<String>) {
+    let mut offset = 0;
+    while let Some(index) = find_js_keyword(body, keyword, offset) {
+        let cursor = skip_js_whitespace(body, index + keyword.len());
+        if let Some((name, end)) = scan_js_identifier_at(body, cursor) {
+            names.insert(name.to_owned());
+            offset = end;
+        } else {
+            offset = index + keyword.len();
+        }
+    }
+}
+
+fn collect_jsx_variable_declaration_names(body: &str, keyword: &str, names: &mut BTreeSet<String>) {
+    let mut offset = 0;
+    while let Some(index) = find_js_keyword(body, keyword, offset) {
+        let mut cursor = skip_js_whitespace(body, index + keyword.len());
+        loop {
+            cursor = skip_js_whitespace(body, cursor);
+            let Some(ch) = char_at(body, cursor) else {
+                break;
+            };
+            if matches!(ch, '{' | '[') {
+                let Some(end) = scan_js_balanced(body, cursor) else {
+                    break;
+                };
+                for local in binding_pattern_locals(&body[cursor..end]) {
+                    names.insert(local);
+                }
+                cursor = end;
+            } else if let Some((name, end)) = scan_js_identifier_at(body, cursor) {
+                names.insert(name.to_owned());
+                cursor = end;
+            } else {
+                break;
+            }
+
+            let (next, separator) = scan_js_declarator_separator(body, cursor);
+            cursor = next;
+            if separator == Some(',') {
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        offset = cursor.max(index + keyword.len());
+    }
+}
+
+fn find_js_keyword(body: &str, keyword: &str, mut offset: usize) -> Option<usize> {
+    while let Some(relative) = body[offset..].find(keyword) {
+        let index = offset + relative;
+        let end = index + keyword.len();
+        let before_ok = body[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !is_identifier_continue(ch));
+        let after_ok = body[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !is_identifier_continue(ch));
+        if before_ok && after_ok {
+            return Some(index);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn scan_js_identifier_at(body: &str, start: usize) -> Option<(&str, usize)> {
+    let mut chars = body[start..].char_indices();
+    let (_, first) = chars.next()?;
+    if !is_identifier_start(first) {
+        return None;
+    }
+    let mut end = start + first.len_utf8();
+    for (relative, ch) in chars {
+        if !is_identifier_continue(ch) {
+            break;
+        }
+        end = start + relative + ch.len_utf8();
+    }
+    Some((&body[start..end], end))
+}
+
+fn scan_js_balanced(body: &str, start: usize) -> Option<usize> {
+    let mut stack = Vec::new();
+    let mut cursor = start;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while let Some(ch) = char_at(body, cursor) {
+        let next = cursor + ch.len_utf8();
+        if line_comment {
+            line_comment = ch != '\n';
+            cursor = next;
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && char_at(body, next) == Some('/') {
+                block_comment = false;
+                cursor = next + 1;
+            } else {
+                cursor = next;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '/' if char_at(body, next) == Some('/') => {
+                line_comment = true;
+                cursor = next + 1;
+            }
+            '/' if char_at(body, next) == Some('*') => {
+                block_comment = true;
+                cursor = next + 1;
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                cursor = next;
+            }
+            '(' => {
+                stack.push(')');
+                cursor = next;
+            }
+            '[' => {
+                stack.push(']');
+                cursor = next;
+            }
+            '{' => {
+                stack.push('}');
+                cursor = next;
+            }
+            ')' | ']' | '}' if stack.last() == Some(&ch) => {
+                stack.pop();
+                cursor = next;
+                if stack.is_empty() {
+                    return Some(cursor);
+                }
+            }
+            _ => cursor = next,
+        }
+    }
+    None
+}
+
+fn scan_js_declarator_separator(body: &str, start: usize) -> (usize, Option<char>) {
+    let mut cursor = start;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+
+    while let Some(ch) = char_at(body, cursor) {
+        let next = cursor + ch.len_utf8();
+        if line_comment {
+            line_comment = ch != '\n';
+            cursor = next;
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && char_at(body, next) == Some('/') {
+                block_comment = false;
+                cursor = next + 1;
+            } else {
+                cursor = next;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active_quote {
+                quote = None;
+            }
+            cursor = next;
+            continue;
+        }
+        match ch {
+            '/' if char_at(body, next) == Some('/') => {
+                line_comment = true;
+                cursor = next + 1;
+            }
+            '/' if char_at(body, next) == Some('*') => {
+                block_comment = true;
+                cursor = next + 1;
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                cursor = next;
+            }
+            '(' | '[' | '{' => {
+                depth += 1;
+                cursor = next;
+            }
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                cursor = next;
+            }
+            ',' | ';' if depth == 0 => return (cursor, Some(ch)),
+            _ => cursor = next,
+        }
+    }
+    (cursor, None)
+}
+
+fn skip_js_whitespace(body: &str, mut cursor: usize) -> usize {
+    while let Some(ch) = char_at(body, cursor) {
+        if !ch.is_whitespace() {
+            break;
+        }
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn char_at(body: &str, cursor: usize) -> Option<char> {
+    body.get(cursor..)?.chars().next()
 }
 
 fn source_logic_uses_mount(logic: &RenderSourceLogic) -> bool {
