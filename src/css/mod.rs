@@ -100,10 +100,10 @@ impl CssSelector {
     }
 
     #[must_use]
-    pub(crate) fn matching_dynamic_conditions(
+    pub(crate) fn matching_dynamic_branches(
         &self,
         element: &StyleElement<'_, '_>,
-    ) -> Option<Vec<RenderStyleCondition>> {
+    ) -> Vec<(u32, Vec<RenderStyleCondition>)> {
         self.selectors
             .0
             .iter()
@@ -115,8 +115,7 @@ impl CssSelector {
                 let conditions = selector_dynamic_conditions(selector);
                 (!conditions.is_empty()).then_some((selector.specificity(), conditions))
             })
-            .max_by_key(|(specificity, _)| *specificity)
-            .map(|(_, conditions)| conditions)
+            .collect()
     }
 
     #[must_use]

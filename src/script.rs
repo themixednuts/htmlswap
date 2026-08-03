@@ -698,15 +698,14 @@ impl<'a> Visit<'a> for ModuleCollector {
     }
 
     fn visit_method_definition(&mut self, definition: &MethodDefinition<'a>) {
-        if !definition.computed {
-            if let Some(name) = property_key_name(&definition.key) {
-                if let Some(body) = &definition.value.body {
-                    let declarations = self.style_declarations_from_function_body(body);
-                    self.remember_style_factory(name, declarations);
-                    if name == "renderVals" {
-                        self.collect_render_value_style_objects_from_function_body(body);
-                    }
-                }
+        if !definition.computed
+            && let Some(name) = property_key_name(&definition.key)
+            && let Some(body) = &definition.value.body
+        {
+            let declarations = self.style_declarations_from_function_body(body);
+            self.remember_style_factory(name, declarations);
+            if name == "renderVals" {
+                self.collect_render_value_style_objects_from_function_body(body);
             }
         }
 
@@ -924,10 +923,10 @@ fn style_declarations_from_object(
                     );
                 }
                 Expression::ParenthesizedExpression(expression) => {
-                    if let Expression::Identifier(identifier) = &expression.expression {
-                        if let Some(alias) = aliases.get(identifier.name.as_str()) {
-                            merge_script_declarations(&mut declarations, alias.iter().cloned());
-                        }
+                    if let Expression::Identifier(identifier) = &expression.expression
+                        && let Some(alias) = aliases.get(identifier.name.as_str())
+                    {
+                        merge_script_declarations(&mut declarations, alias.iter().cloned());
                     }
                 }
                 _ => {}

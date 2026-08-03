@@ -5,6 +5,10 @@ use crate::resource::ResourceResolver;
 use crate::source::{SourceId, SourceMap};
 
 pub trait ModuleGraphProvider: Send + Sync {
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
     fn graph(&self, input: ModuleGraphInput<'_>) -> Compilation<ModuleGraph>;
 }
 

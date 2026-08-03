@@ -27,6 +27,7 @@ mod script;
 pub mod source;
 mod style;
 pub mod style_provider;
+pub mod tailwind;
 pub mod work;
 
 pub use adapter::{
@@ -57,7 +58,7 @@ pub use compiler::{
     CompilerCacheFileStamp, CompilerCacheStats, CompilerExternalScriptOptions, CompilerOptions,
     CompilerParallelism, CompilerResourceOptions, DEFAULT_EXTERNAL_SCRIPT_MAX_BYTES,
     DEFAULT_EXTERNAL_SCRIPT_TIMEOUT, DEFAULT_RESOURCE_MAX_BYTES, DEFAULT_RESOURCE_TIMEOUT,
-    SourceFrontendKind,
+    ExtensionAttributes, RemoteResources, Scripts, SourceFrontendKind, SourcePolicy,
 };
 pub use dc_bundle::{DcComponentFragment, inline_dc_component_imports};
 pub use diagnostics::{Compilation, Diagnostic, Diagnostics, Severity};
@@ -102,7 +103,7 @@ pub use plan::{
 pub use resource::{
     DefaultResourceResolver, FileSystemResourceResolver, FileSystemResourceResolverOptions,
     HttpResourceResolver, HttpResourceResolverOptions, NoopResourceResolver, ResourceKind,
-    ResourceReferrer, ResourceRequest, ResourceResolver, ResourceSource,
+    ResourceReferrer, ResourceRequest, ResourceResolver, ResourceResolverChain, ResourceSource,
 };
 pub use roundtrip::{
     RoundTripComparison, RoundTripFeatureKind, RoundTripMismatch, RoundTripMismatchKind,
@@ -115,6 +116,12 @@ pub use source::{
 pub use style::{StyleDeclaration, StyleOrigin, StyleProperty, StyleToken, StyleValue};
 pub use style_provider::{
     GeneratedStyleSource, StyleProvider, StyleProviderInput, StyleProviderOutput,
+    StyleProviderPipeline,
+};
+pub use tailwind::{
+    DEFAULT_TAILWIND_MAX_INPUT_BYTES, DEFAULT_TAILWIND_MAX_OUTPUT_BYTES,
+    DEFAULT_TAILWIND_SOURCE_NAME, DEFAULT_TAILWIND_STYLESHEET, DEFAULT_TAILWIND_TIMEOUT,
+    TailwindCli, TailwindEngine, TailwindError, TailwindInput, TailwindProvider,
 };
 pub use work::{
     CancellationToken, JobBatch, JobContext, JobRunner, JobRunnerBuildError, JobRunnerPolicy,

@@ -690,6 +690,10 @@ pub struct RenderElement {
     pub source_tag: CompactString,
     pub attributes: Vec<RenderAttribute>,
     pub classes: Vec<CompactString>,
+    /// Inline declarations as authored on the source element. `styles` contains
+    /// the resolved cascade; source-generating adapters use this provenance to
+    /// preserve declarations that a stylesheet `!important` rule suppresses.
+    pub source_inline_styles: Vec<StyleDeclaration>,
     pub styles: Vec<StyleDeclaration>,
     pub stylesheet_rules: Vec<RenderStylesheetRule>,
     pub stylesheet_declarations: Vec<StyleDeclaration>,

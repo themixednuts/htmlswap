@@ -354,7 +354,7 @@ fn root_styles_for_element<'a>(
 
     merge_inline_styles(&mut styles, inline_styles);
     let mut style_variants = style_variants;
-    style_variants.extend(inline_style_variants);
+    merge_inline_style_variants(&mut style_variants, inline_style_variants);
     let (style_variants, _pseudo_elements) = split_pseudo_elements(style_variants);
     (styles, style_variants)
 }
@@ -774,11 +774,8 @@ fn lower_element<'a>(
                 )
             },
         );
-    let inline_properties = inline_styles
-        .iter()
-        .map(|style| style.property.clone())
-        .collect::<Vec<_>>();
-    merge_inline_styles(&mut styles, inline_styles);
+    let source_inline_styles = inline_styles.clone();
+    let inline_properties = merge_inline_styles(&mut styles, inline_styles);
     let stylesheet_declarations = stylesheet_winners
         .into_iter()
         .filter(|declaration| !inline_properties.contains(&declaration.property))
@@ -790,7 +787,7 @@ fn lower_element<'a>(
         })
         .collect::<Vec<_>>();
     let mut style_variants = style_variants;
-    style_variants.extend(inline_style_variants);
+    merge_inline_style_variants(&mut style_variants, inline_style_variants);
     let (style_variants, pseudo_elements) = split_pseudo_elements(style_variants);
     let semantics = semantics_for_element(lowered_element);
     let own_region = region_for_element(lowered_element, &mut runtime.diagnostics);
@@ -843,6 +840,7 @@ fn lower_element<'a>(
         source_tag: tag,
         attributes,
         classes,
+        source_inline_styles,
         styles,
         stylesheet_rules,
         stylesheet_declarations,
@@ -961,17 +959,65 @@ fn is_foreign_element(element: &HtmlElement) -> bool {
         .is_some_and(|namespace| namespace != "http://www.w3.org/1999/xhtml" && namespace != "html")
 }
 
-fn merge_inline_styles(styles: &mut Vec<StyleDeclaration>, inline_styles: Vec<StyleDeclaration>) {
+fn merge_inline_styles(
+    styles: &mut Vec<StyleDeclaration>,
+    inline_styles: Vec<StyleDeclaration>,
+) -> Vec<StyleProperty> {
+    let mut applied_properties = Vec::new();
     for inline_style in inline_styles {
         if let Some(existing) = styles
             .iter_mut()
             .find(|style| style.property == inline_style.property)
         {
-            *existing = inline_style;
+            if !existing.important || inline_style.important {
+                applied_properties.push(inline_style.property.clone());
+                *existing = inline_style;
+            }
         } else {
+            applied_properties.push(inline_style.property.clone());
             styles.push(inline_style);
         }
     }
+    applied_properties
+}
+
+fn merge_inline_style_variants(
+    variants: &mut Vec<RenderStyleVariant>,
+    inline_variants: Vec<RenderStyleVariant>,
+) {
+    for mut inline_variant in inline_variants {
+        inline_variant.declarations.retain(|inline_declaration| {
+            let matching_variants = variants.iter().filter(|variant| {
+                same_style_conditions(&variant.conditions, &inline_variant.conditions)
+            });
+            let blocked_by_important = matching_variants
+                .flat_map(|variant| &variant.declarations)
+                .any(|declaration| {
+                    declaration.property == inline_declaration.property
+                        && declaration.important
+                        && !inline_declaration.important
+                });
+            if blocked_by_important {
+                return false;
+            }
+            for variant in variants.iter_mut().filter(|variant| {
+                same_style_conditions(&variant.conditions, &inline_variant.conditions)
+            }) {
+                variant
+                    .declarations
+                    .retain(|declaration| declaration.property != inline_declaration.property);
+            }
+            true
+        });
+        variants.retain(|variant| !variant.declarations.is_empty());
+        if !inline_variant.declarations.is_empty() {
+            variants.push(inline_variant);
+        }
+    }
+}
+
+fn same_style_conditions(left: &[RenderStyleCondition], right: &[RenderStyleCondition]) -> bool {
+    left.len() == right.len() && left.iter().all(|condition| right.contains(condition))
 }
 
 fn style_declarations_match(left: &StyleDeclaration, right: &StyleDeclaration) -> bool {

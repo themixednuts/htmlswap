@@ -162,10 +162,11 @@ fn corpus_project_mode_emits_no_unresolved_internal_refs() {
         return;
     };
     let corpus = PathBuf::from(corpus);
-    if !corpus.exists() {
-        eprintln!("skipping corpus smoke test; {} is absent", corpus.display());
-        return;
-    }
+    assert!(
+        corpus.is_dir(),
+        "HTMLSWAP_JSX_CORPUS must name a readable project directory: {}",
+        corpus.display()
+    );
 
     let (artifact, diagnostics) = emit_svelte_jsx_project_from_dir(&corpus);
     let serious = diagnostics

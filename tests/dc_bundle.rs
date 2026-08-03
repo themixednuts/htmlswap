@@ -57,9 +57,11 @@ fn gpui_debug_ids_use_child_component_source_after_dc_expansion() {
     let expanded =
         inline_dc_component_imports(root.value, [DcComponentFragment::new("Card", card.value)]);
 
-    let mut options = GpuiAdapterOptions::default();
-    options.emit_debug_layout_ids = true;
-    options.format = RustFormatOptions::disabled();
+    let options = GpuiAdapterOptions {
+        emit_debug_layout_ids: true,
+        format: RustFormatOptions::disabled(),
+        ..GpuiAdapterOptions::default()
+    };
     let mut cx = AdapterContext::new();
     let output = GpuiAdapter::new(options)
         .adapt(&expanded, &mut cx)

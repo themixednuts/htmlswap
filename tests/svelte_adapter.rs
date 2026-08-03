@@ -18,9 +18,11 @@ fn adapt_svelte(
     );
 
     let mut cx = AdapterContext::new();
-    let mut options = SvelteAdapterOptions::default();
-    options.component_name = "Demo".into();
-    options.emit_source_comments = false;
+    let options = SvelteAdapterOptions {
+        component_name: "Demo".into(),
+        emit_source_comments: false,
+        ..SvelteAdapterOptions::default()
+    };
     let output = SvelteAdapter::new(options)
         .adapt(&compiled.value, &mut cx)
         .expect("Svelte adapter should emit code");

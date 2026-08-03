@@ -3,6 +3,8 @@ use std::fmt::Write;
 
 use compact_str::CompactString;
 use heck::ToSnakeCase;
+use lightningcss::traits::Parse;
+use lightningcss::values::color::CssColor;
 use rustfmt_wrapper::config::{Config as RustfmtConfig, Edition, NewlineStyle};
 use rustfmt_wrapper::rustfmt_config;
 use smallvec::SmallVec;
@@ -3349,7 +3351,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         if !matches!(&state.kind, RenderStateKind::TextInput(_)) {
             return false;
         }
-        if !matches!(&action.payload, ActionPayload::ElementState { state_id } if state_id == &state.id)
+        if !matches!(&action.payload, ActionPayload::ElementState { state_id } if state_id == state.id)
         {
             return false;
         }
@@ -4649,6 +4651,10 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                 self.gpui_background_method_with_tokens(style)
                     .or_else(|| gpui_style_method_for_value(&style.property, style.value.as_str()))
             }
+            StyleValue::Raw(_) => self
+                .literal_text_with_tokens(style)
+                .and_then(|value| gpui_style_method_for_value(&style.property, &value))
+                .or_else(|| gpui_style_method_for_value(&style.property, style.value.as_str())),
             _ => gpui_style_method_for_value(&style.property, style.value.as_str()),
         }
     }
@@ -4780,6 +4786,20 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
     fn literal_value_for_token(&self, token: &StyleToken) -> Option<StyleValue> {
         let mut seen = BTreeSet::new();
         self.literal_value_for_token_inner(token, &mut seen)
+    }
+
+    fn literal_text_with_tokens(&self, style: &StyleDeclaration) -> Option<String> {
+        let mut value = style.value.as_str().to_owned();
+        let mut changed = false;
+        for token in style.value.tokens_with_span(style.span) {
+            let Some(literal) = self.literal_value_for_token(&token) else {
+                continue;
+            };
+            let replaced = value.replace(token.raw.as_str(), literal.as_str());
+            changed |= replaced != value;
+            value = replaced;
+        }
+        changed.then_some(value)
     }
 
     fn literal_value_for_token_inner(
@@ -5867,15 +5887,46 @@ const GPUI_COMPONENT_THEME_COLOR_FIELDS: &[&str] = &[
 ];
 
 fn dynamic_style_method_name(conditions: &[RenderStyleCondition]) -> Option<&'static str> {
-    let [RenderStyleCondition::PseudoClass(value)] = conditions else {
+    let mut pseudo_classes = conditions.iter().filter_map(|condition| match condition {
+        RenderStyleCondition::PseudoClass(value) => Some(value.as_str()),
+        _ => None,
+    });
+    let value = pseudo_classes.next()?;
+    if pseudo_classes.next().is_some()
+        || conditions.iter().any(|condition| match condition {
+            RenderStyleCondition::PseudoClass(_) => false,
+            RenderStyleCondition::Media(query) => !interaction_media_allows(query, value),
+            RenderStyleCondition::PseudoElement(_)
+            | RenderStyleCondition::Supports(_)
+            | RenderStyleCondition::Container(_) => true,
+        })
+    {
         return None;
-    };
+    }
 
-    match value.as_str() {
+    match value {
         "hover" => Some("hover"),
         "active" => Some("active"),
-        "focus" => Some("focus"),
+        // GPUI currently exposes one focus style hook. Treat `:focus-visible` as
+        // that hook so keyboard-focus affordances remain functional instead of
+        // being discarded by the adapter.
+        "focus" | "focus-visible" => Some("focus"),
         _ => None,
+    }
+}
+
+fn interaction_media_allows(query: &str, pseudo_class: &str) -> bool {
+    let query = normalize_css_keyword(query);
+    match pseudo_class {
+        "hover" => matches!(
+            query.as_str(),
+            "(hover:hover)" | "(hover: hover)" | "(any-hover:hover)" | "(any-hover: hover)"
+        ),
+        "focus" | "focus-visible" => {
+            matches!(query.as_str(), "(focus:focus)" | "(focus: focus)")
+        }
+        "active" => false,
+        _ => false,
     }
 }
 
@@ -5916,7 +5967,7 @@ fn style_variant_preservation_reason(variant: &RenderStyleVariant) -> String {
         matches!(
             condition,
             RenderStyleCondition::PseudoClass(value)
-                if value == "focus-visible" || value == "focus-within"
+                if value == "focus-within"
         )
     }) {
         return "this focus pseudo-class has no exact GPUI style hook".to_owned();
@@ -6235,7 +6286,7 @@ fn parse_box_edge_methods(
     all_method: &str,
     side_methods: [&str; 4],
 ) -> Option<String> {
-    let parts = value.split_whitespace().collect::<Vec<_>>();
+    let parts = split_top_level_whitespace(value);
     let expanded = match parts.as_slice() {
         [all] => {
             let value = parse_length(all, options)?;
@@ -6430,15 +6481,14 @@ fn parse_element_transform_offset(
         (parse_translate_component(inner, width)?, 0.0)
     } else if let Some(inner) = strip_css_function(&transform, "translatey") {
         (0.0, parse_translate_component(inner, height)?)
-    } else if let Some(inner) = strip_css_function(&transform, "translate") {
+    } else {
+        let inner = strip_css_function(&transform, "translate")?;
         let parts = split_translate_arguments(inner);
         let x = parse_translate_component(parts.first().copied()?, width)?;
         let y = parts
             .get(1)
             .map_or(Some(0.0), |part| parse_translate_component(part, height))?;
         (x, y)
-    } else {
-        return None;
     };
 
     let horizontal_margin = if element_has_right_without_left(element) {
@@ -6796,6 +6846,12 @@ fn parse_justify_content(value: &str) -> Option<String> {
 
 fn parse_length(value: &str, options: LengthOptions) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
+    if let Some(inner) = strip_css_function(&value, "calc")
+        && let Some(value) = simplify_calc_length(inner)
+    {
+        return parse_length(&value, options);
+    }
+
     if value == "0" {
         return Some("gpui::px(0.0)".to_owned());
     }
@@ -6834,6 +6890,42 @@ fn parse_length(value: &str, options: LengthOptions) -> Option<String> {
     }
 
     None
+}
+
+fn simplify_calc_length(value: &str) -> Option<String> {
+    let value = strip_wrapping_parentheses(value.trim());
+    let (left, operator, right) = split_top_level_binary(value, &['*', '/'])?;
+    let left = strip_wrapping_parentheses(left.trim());
+    let right = strip_wrapping_parentheses(right.trim());
+
+    let (number, unit) = match operator {
+        '*' => {
+            if let Some((length, unit)) = parse_numeric_dimension(left) {
+                (length * parse_css_number(right)?, unit)
+            } else {
+                let scalar = parse_css_number(left)?;
+                let (length, unit) = parse_numeric_dimension(right)?;
+                (scalar * length, unit)
+            }
+        }
+        '/' => {
+            let (length, unit) = parse_numeric_dimension(left)?;
+            let divisor = parse_css_number(right)?;
+            if float_is_zero(divisor) {
+                return None;
+            }
+            (length / divisor, unit)
+        }
+        _ => return None,
+    };
+
+    Some(format!("{}{unit}", format_float(number)))
+}
+
+fn parse_numeric_dimension(value: &str) -> Option<(f32, &'static str)> {
+    ["rem", "px", "em", "vw", "vh", "%"]
+        .into_iter()
+        .find_map(|unit| parse_numeric_suffix(value, unit).map(|number| (number, unit)))
 }
 
 fn is_intrinsic_size_keyword(value: &str) -> bool {
@@ -6906,7 +6998,9 @@ fn parse_color_literal(value: &str) -> Option<ColorLiteral> {
         "green" => ColorLiteral::Rgb(0x008000),
         "blue" => ColorLiteral::Rgb(0x0000FF),
         "transparent" => ColorLiteral::Rgba(0x00000000),
-        _ => parse_hex_color(&value).or_else(|| parse_function_color(&value))?,
+        _ => parse_hex_color(&value)
+            .or_else(|| parse_function_color(&value))
+            .or_else(|| parse_modern_color(&value))?,
     })
 }
 
@@ -6914,6 +7008,18 @@ fn parse_color_literal(value: &str) -> Option<ColorLiteral> {
 enum ColorLiteral {
     Rgb(u32),
     Rgba(u32),
+}
+
+fn parse_modern_color(value: &str) -> Option<ColorLiteral> {
+    let CssColor::RGBA(color) = CssColor::parse_string(value).ok()?.to_rgb().ok()? else {
+        return None;
+    };
+    let rgb = (u32::from(color.red) << 16) | (u32::from(color.green) << 8) | u32::from(color.blue);
+    if color.alpha == u8::MAX {
+        Some(ColorLiteral::Rgb(rgb))
+    } else {
+        Some(ColorLiteral::Rgba((rgb << 8) | u32::from(color.alpha)))
+    }
 }
 
 fn color_is_low_saturation_dark(value: &str) -> bool {

@@ -681,9 +681,10 @@ fn emit_project_ts_module(
         if text.is_empty() {
             continue;
         }
-        if matches!(statement, Statement::FunctionDeclaration(_)) {
-            statements.push(format!("export {text}"));
-        } else if matches!(statement, Statement::VariableDeclaration(_)) {
+        if matches!(
+            statement,
+            Statement::FunctionDeclaration(_) | Statement::VariableDeclaration(_)
+        ) {
             statements.push(format!("export {text}"));
         }
     }
@@ -829,7 +830,7 @@ fn rewrite_project_value_references_with_imports(
     let mut rewritten = code.to_owned();
     let mut imports: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut values = registry.value_symbols();
-    values.sort_by(|left, right| right.name.len().cmp(&left.name.len()));
+    values.sort_by_key(|value| std::cmp::Reverse(value.name.len()));
     for symbol in values {
         let name = symbol.name.as_str();
         let needle = format!("window.{name}");
@@ -1684,7 +1685,7 @@ impl<'a> JsxLowerer<'a> {
             }
         }
 
-        for statement in component_setup_statements(body, self.source) {
+        for statement in component_setup_statements(body) {
             let Statement::VariableDeclaration(declaration) = statement else {
                 continue;
             };
@@ -1702,7 +1703,7 @@ impl<'a> JsxLowerer<'a> {
     }
 
     fn component_logic_items(&mut self, body: &'a FunctionBody<'a>) -> Vec<RenderSourceLogicItem> {
-        let statements = component_setup_statements(body, self.source);
+        let statements = component_setup_statements(body);
         let mut items = Vec::new();
         let mut index = 0usize;
         while index < statements.len() {
@@ -2539,8 +2540,7 @@ return groups;"
         match statement {
             Statement::ReturnStatement(statement) => {
                 let expression = statement.argument.as_ref()?;
-                render_return_expression(expression, self.source)
-                    .then_some((expression, Vec::new()))
+                render_return_expression(expression).then_some((expression, Vec::new()))
             }
             Statement::BlockStatement(block) => {
                 let mut locals = Vec::new();
@@ -2551,7 +2551,7 @@ return groups;"
                         }
                         Statement::ReturnStatement(statement) => {
                             let expression = statement.argument.as_ref()?;
-                            return render_return_expression(expression, self.source)
+                            return render_return_expression(expression)
                                 .then_some((expression, locals));
                         }
                         _ => return None,
@@ -3984,6 +3984,7 @@ return groups;"
             source_tag: tag.into(),
             attributes: Vec::new(),
             classes: Vec::new(),
+            source_inline_styles: Vec::new(),
             styles: Vec::new(),
             stylesheet_rules: Vec::new(),
             stylesheet_declarations: Vec::new(),
@@ -4043,20 +4044,19 @@ fn return_expression_from_statement<'b, 'a>(
     }
 }
 
-fn statement_is_component_return_guard(statement: &Statement<'_>, source: &str) -> bool {
+fn statement_is_component_return_guard(statement: &Statement<'_>) -> bool {
     let Statement::IfStatement(statement) = statement else {
         return false;
     };
-    statement.alternate.is_none()
-        && render_return_expression_from_statement(&statement.consequent, source)
+    statement.alternate.is_none() && render_return_expression_from_statement(&statement.consequent)
 }
 
-fn render_return_expression_from_statement(statement: &Statement<'_>, source: &str) -> bool {
+fn render_return_expression_from_statement(statement: &Statement<'_>) -> bool {
     match statement {
         Statement::ReturnStatement(statement) => statement
             .argument
             .as_ref()
-            .is_some_and(|expression| render_return_expression(expression, source)),
+            .is_some_and(render_return_expression),
         Statement::BlockStatement(block) => {
             let mut saw_return = false;
             for statement in &block.body {
@@ -4066,7 +4066,7 @@ fn render_return_expression_from_statement(statement: &Statement<'_>, source: &s
                         saw_return = statement
                             .argument
                             .as_ref()
-                            .is_some_and(|expression| render_return_expression(expression, source));
+                            .is_some_and(render_return_expression);
                         break;
                     }
                     _ => return false,
@@ -4078,19 +4078,19 @@ fn render_return_expression_from_statement(statement: &Statement<'_>, source: &s
     }
 }
 
-fn render_return_expression(expression: &Expression<'_>, source: &str) -> bool {
+fn render_return_expression(expression: &Expression<'_>) -> bool {
     match expression {
         Expression::ParenthesizedExpression(expression) => {
-            render_return_expression(&expression.expression, source)
+            render_return_expression(&expression.expression)
         }
         Expression::JSXElement(_) | Expression::JSXFragment(_) => true,
         Expression::NullLiteral(_) => true,
         Expression::LogicalExpression(logical) if logical.operator.as_str() == "&&" => {
-            render_return_expression(&logical.right, source)
+            render_return_expression(&logical.right)
         }
         Expression::ConditionalExpression(conditional) => {
-            render_return_expression(&conditional.consequent, source)
-                && render_return_expression(&conditional.alternate, source)
+            render_return_expression(&conditional.consequent)
+                && render_return_expression(&conditional.alternate)
         }
         _ => false,
     }
@@ -4301,15 +4301,12 @@ fn remove_state_item(items: &mut Vec<RenderSourceLogicItem>, name: &str) {
     });
 }
 
-fn component_setup_statements<'b, 'a>(
-    body: &'b FunctionBody<'a>,
-    source: &str,
-) -> Vec<&'b Statement<'a>> {
+fn component_setup_statements<'b, 'a>(body: &'b FunctionBody<'a>) -> Vec<&'b Statement<'a>> {
     body.statements
         .iter()
         .take_while(|statement| {
             !matches!(statement, Statement::ReturnStatement(_))
-                && !statement_is_component_return_guard(statement, source)
+                && !statement_is_component_return_guard(statement)
         })
         .collect()
 }

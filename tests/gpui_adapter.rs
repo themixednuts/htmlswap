@@ -106,8 +106,10 @@ fn gpui_adapter_can_debug_original_source_html_above_elements() {
     );
     assert!(compiled.diagnostics.is_empty());
 
-    let mut options = GpuiAdapterOptions::default();
-    options.emit_debug_source_html_comments = true;
+    let options = GpuiAdapterOptions {
+        emit_debug_source_html_comments: true,
+        ..GpuiAdapterOptions::default()
+    };
 
     let mut adapter_context = AdapterContext::new();
     let output = GpuiAdapter::new(options)
@@ -137,8 +139,10 @@ fn gpui_adapter_can_emit_source_stable_layout_debug_ids() {
     );
     assert!(compiled.diagnostics.is_empty());
 
-    let mut options = GpuiAdapterOptions::default();
-    options.emit_debug_layout_ids = true;
+    let options = GpuiAdapterOptions {
+        emit_debug_layout_ids: true,
+        ..GpuiAdapterOptions::default()
+    };
 
     let mut adapter_context = AdapterContext::new();
     let output = GpuiAdapter::new(options)
@@ -1455,7 +1459,8 @@ fn gpui_adapter_preserves_conditional_css_with_target_strategy_comments() {
 
     syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
 
-    assert!(code.contains(":focus-visible"));
+    assert!(code.contains(".focus(|this|"));
+    assert!(!code.contains("conditional CSS :focus-visible"));
     assert!(code.contains("@media"));
     assert!(code.contains("@supports"));
     assert!(code.contains("@container"));
@@ -1487,7 +1492,8 @@ fn gpui_adapter_does_not_attach_unanchored_global_pseudo_css_to_every_element() 
     syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
     assert!(!code.contains(r#"pseudo-element CSS selector="::selection""#));
     assert!(!code.contains(r#"pseudo-element CSS selector="*:hover::-webkit-scrollbar-thumb""#));
-    assert!(code.contains("conditional CSS :focus-visible .primary:focus-visible"));
+    assert!(code.contains(".focus(|this|"));
+    assert!(!code.contains("conditional CSS :focus-visible"));
     assert!(adapter_context.diagnostics().is_empty());
 }
 

@@ -836,18 +836,18 @@ impl GpuiReader {
                 return false;
             }
             if let Some(expression) = &expression
-                && !hint
+                && hint
                     .expression
                     .as_deref()
-                    .is_some_and(|hint| normalize_control_flow_expression(hint) == *expression)
+                    .is_none_or(|hint| normalize_control_flow_expression(hint) != *expression)
             {
                 return false;
             }
             if let Some(binding) = &binding
-                && !hint
+                && hint
                     .binding
                     .as_deref()
-                    .is_some_and(|hint| normalize_control_flow_binding(hint) == *binding)
+                    .is_none_or(|hint| normalize_control_flow_binding(hint) != *binding)
             {
                 return false;
             }
@@ -1762,11 +1762,10 @@ fn source_hint_attribute(line: &str) -> Option<(CompactString, CompactString)> {
             CompactString::from(format!("data-htmlswap-prop-{}", name.trim())),
             CompactString::from(unquote_debug_string(value.trim())),
         ));
-    } else if let Some(attribute) = line.strip_prefix("unmapped attribute: ") {
+    } else {
+        let attribute = line.strip_prefix("unmapped attribute: ")?;
         let (name, value) = parse_unmapped_attribute(attribute)?;
         return Some((name.into(), value.into()));
-    } else {
-        return None;
     };
 
     Some((name.into(), CompactString::from(value.trim())))
@@ -2327,8 +2326,7 @@ fn normalize_control_flow_expression(expression: &str) -> String {
         .trim_start_matches("self.")
         .trim_start_matches("this.")
         .replace("()", "")
-        .replace('_', "")
-        .replace('.', "")
+        .replace(['_', '.'], "")
         .replace(char::is_whitespace, "")
         .to_ascii_lowercase()
 }
@@ -3101,7 +3099,7 @@ fn apply_source_hint(element: &mut RenderElement, hint: SourceHint) {
         element.source_tag = tag;
     }
     for class in hint.classes {
-        if !element.classes.iter().any(|existing| existing == &class) {
+        if !element.classes.contains(&class) {
             element.classes.push(class);
         }
     }
@@ -3936,6 +3934,7 @@ fn element(tag: &str, role: UiRole) -> RenderElement {
         source_tag: tag.into(),
         attributes: Vec::new(),
         classes: Vec::new(),
+        source_inline_styles: Vec::new(),
         styles: Vec::new(),
         stylesheet_rules: Vec::new(),
         stylesheet_declarations: Vec::new(),

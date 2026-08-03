@@ -11,8 +11,8 @@ use htmlswap::{
     RenderActionEffect, RenderActionHandlerEffect, RenderAnnotationKind, RenderControlFlowKind,
     RenderDensity, RenderElement, RenderNode, RenderScriptKind, RenderSize, RenderStateKind,
     RenderStateOwner, RenderStateValueSource, RenderStyleCondition, RenderThemeScope, RenderTone,
-    RenderValidationConstraint, RenderVariant, RouteTarget, SourceId, SourceKind, StyleProperty,
-    StyleValue, TextEmitter, ThemeTokenKind, UiRole, compile_fragment,
+    RenderValidationConstraint, RenderVariant, RouteTarget, SourceId, SourceKind, SourcePolicy,
+    StyleProperty, StyleValue, TextEmitter, ThemeTokenKind, UiRole, compile_fragment,
     compile_fragment_with_assets, parse_fragment,
 };
 use url::Url;
@@ -34,6 +34,108 @@ fn file_url(path: &Path) -> String {
     Url::from_file_path(path)
         .expect("test path should convert to a file URL")
         .to_string()
+}
+
+#[test]
+fn pure_html_policy_accepts_standard_local_markup() {
+    let compiler = Compiler::try_with_options(
+        CompilerOptions::new().with_source_policy(SourcePolicy::pure_html()),
+    )
+    .expect("pure HTML compiler should build");
+    let compiled = compiler.compile_fragment(
+        r#"
+            <style>.toolbar { display: flex; gap: 8px; }</style>
+            <main id="app">
+                <label for="title">Title</label>
+                <input id="title" required>
+                <button id="save" class="primary">Save</button>
+            </main>
+        "#,
+        &CompileAssets::new(),
+    );
+
+    assert!(!compiled.diagnostics.has_errors());
+    assert!(!compiled.value.plan.is_empty());
+}
+
+#[test]
+fn grid_column_is_a_typed_pure_css_property() {
+    let compiled = Compiler::new().compile_fragment(
+        r#"<style>.wide { grid-column: 1 / span 2; }</style><div class="wide">Wide</div>"#,
+        &CompileAssets::new(),
+    );
+
+    assert!(compiled.diagnostics.is_empty());
+    let RenderNode::Element(element) = &compiled.value.plan.nodes[0] else {
+        panic!("expected grid child");
+    };
+    assert!(element.styles.iter().any(|style| {
+        style.property == StyleProperty::GridColumn && style.value.as_str() == "1 / span 2"
+    }));
+}
+
+#[test]
+fn pure_html_policy_rejects_extensions_scripts_and_remote_references() {
+    let compiler = Compiler::try_with_options(
+        CompilerOptions::new().with_source_policy(SourcePolicy::pure_html()),
+    )
+    .expect("pure HTML compiler should build");
+    let compiled = compiler.compile_fragment(
+        r#"
+            <script>dangerous()</script>
+            <button data-htmlswap-tone="danger" onclick="dangerous()">Delete</button>
+            <img src="https://example.invalid/tracker.png">
+            <a href="HTTPS:example.invalid/account">Account</a>
+        "#,
+        &CompileAssets::new(),
+    );
+    let messages = compiled
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(compiled.diagnostics.has_errors());
+    assert!(compiled.value.plan.is_empty());
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("active `<script>`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("data-htmlswap-tone"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("executable attribute `onclick`"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("remote reference in `src`"))
+    );
+}
+
+#[test]
+fn pure_html_policy_rejects_untrusted_compiler_assets() {
+    let compiler = Compiler::try_with_options(
+        CompilerOptions::new().with_source_policy(SourcePolicy::pure_html()),
+    )
+    .expect("pure HTML compiler should build");
+    let assets = CompileAssets::new()
+        .with_script(Some("actions.js".to_owned()), "dangerous()")
+        .with_stylesheet(
+            Some("remote.css".to_owned()),
+            ".avatar { background: url(https://example.invalid/avatar.png); }",
+        );
+    let compiled = compiler.compile_fragment("<main>Safe source</main>", &assets);
+
+    assert!(compiled.diagnostics.has_errors());
+    assert!(compiled.value.plan.is_empty());
+    assert_eq!(compiled.diagnostics.len(), 2);
 }
 
 fn find_element_by_tag<'a>(nodes: &'a [RenderNode], tag: &str) -> Option<&'a RenderElement> {

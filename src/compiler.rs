@@ -13,6 +13,7 @@ use crate::adapter::AdapterArtifact;
 use crate::adapters::svelte::SvelteAdapterOptions;
 use crate::assets::CompileAssets;
 use crate::bundle::{BundleConfig, BundlePlan};
+use crate::class::ClassIndex;
 use crate::css::{
     StyleIndex, Stylesheet, StylesheetImport, inline_stylesheets, parse_stylesheet_with_offset,
     parse_stylesheet_with_source,
@@ -28,13 +29,14 @@ use crate::plan::{RenderAnnotation, RenderPlan};
 use crate::resource::{
     DefaultResourceResolver, FileSystemResourceResolver, FileSystemResourceResolverOptions,
     HttpResourceResolver, HttpResourceResolverOptions, NoopResourceResolver, ResourceKind,
-    ResourceReferrer, ResourceRequest, ResourceResolver, ResourceSource,
+    ResourceReferrer, ResourceRequest, ResourceResolver, ResourceResolverChain, ResourceSource,
 };
 use crate::script::{
     ActionIndex, ScriptImport, ScriptModule, ScriptStyleIndex, parse_inline_script_with_offset,
     parse_script_with_source,
 };
 use crate::source::{SourceFile, SourceId, SourceKind, SourceMap};
+use crate::style_provider::{StyleProvider, StyleProviderInput, StyleProviderPipeline};
 use crate::work::{JobContext, JobRunner, JobRunnerBuildError};
 
 #[derive(Clone)]
@@ -44,6 +46,7 @@ pub struct Compiler {
     cache: Option<CompilerCache>,
     resolver: Arc<dyn ResourceResolver>,
     frontend: Arc<Frontend>,
+    style_providers: StyleProviderPipeline,
 }
 
 impl Compiler {
@@ -60,6 +63,7 @@ impl Compiler {
         Ok(Self {
             resolver: resource_resolver_from_options(&options),
             frontend: Arc::new(Frontend::default()),
+            style_providers: StyleProviderPipeline::new(),
             options,
             jobs,
             cache: None,
@@ -89,6 +93,7 @@ impl Compiler {
         Self {
             resolver: resource_resolver_from_options(&options),
             frontend: Arc::new(Frontend::default()),
+            style_providers: StyleProviderPipeline::new(),
             options,
             jobs,
             cache: None,
@@ -113,6 +118,20 @@ impl Compiler {
         self
     }
 
+    /// Adds a resolver after the current resolver without replacing it.
+    #[must_use]
+    pub fn with_fallback_resource_resolver(
+        mut self,
+        resolver: impl ResourceResolver + 'static,
+    ) -> Self {
+        self.resolver = Arc::new(
+            ResourceResolverChain::new()
+                .with_resolver_arc(self.resolver.clone())
+                .with_resolver(resolver),
+        );
+        self
+    }
+
     #[must_use]
     pub fn with_frontend(mut self, frontend: Frontend) -> Self {
         self.frontend = Arc::new(frontend);
@@ -123,6 +142,25 @@ impl Compiler {
     pub fn with_frontend_arc(mut self, frontend: Arc<Frontend>) -> Self {
         self.frontend = frontend;
         self
+    }
+
+    /// Appends a generated-style capability to the compiler pipeline.
+    #[must_use]
+    pub fn with_style_provider(mut self, provider: impl StyleProvider + 'static) -> Self {
+        self.style_providers.push(provider);
+        self
+    }
+
+    /// Appends a type-erased generated-style capability to the compiler pipeline.
+    #[must_use]
+    pub fn with_style_provider_arc(mut self, provider: Arc<dyn StyleProvider>) -> Self {
+        self.style_providers.push_arc(provider);
+        self
+    }
+
+    #[must_use]
+    pub fn style_providers(&self) -> &StyleProviderPipeline {
+        &self.style_providers
     }
 
     #[must_use]
@@ -164,8 +202,10 @@ impl Compiler {
             self.resolver.as_ref(),
             self.frontend.as_ref(),
             self.options.source_frontend,
+            self.options.source_policy,
             &self.options.bundle,
             self.cache.as_ref(),
+            &self.style_providers,
         )
     }
 }
@@ -183,6 +223,7 @@ impl fmt::Debug for Compiler {
             .field("options", &self.options)
             .field("cache", &self.cache.as_ref().map(CompilerCache::stats))
             .field("frontend", &self.frontend)
+            .field("style_providers", &self.style_providers)
             .finish()
     }
 }
@@ -444,6 +485,7 @@ pub struct CompilerOptions {
     pub resources: CompilerResourceOptions,
     pub bundle: BundleConfig,
     pub source_frontend: SourceFrontendKind,
+    pub source_policy: SourcePolicy,
 }
 
 impl CompilerOptions {
@@ -495,6 +537,53 @@ impl CompilerOptions {
     pub fn with_source_frontend(mut self, source_frontend: SourceFrontendKind) -> Self {
         self.source_frontend = source_frontend;
         self
+    }
+
+    #[must_use]
+    pub fn with_source_policy(mut self, source_policy: SourcePolicy) -> Self {
+        self.source_policy = source_policy;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExtensionAttributes {
+    #[default]
+    Allow,
+    Forbid,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Scripts {
+    #[default]
+    Allow,
+    Forbid,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RemoteResources {
+    #[default]
+    Allow,
+    Forbid,
+}
+
+/// Source features accepted before target semantics are lowered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourcePolicy {
+    pub extension_attributes: ExtensionAttributes,
+    pub scripts: Scripts,
+    pub remote_resources: RemoteResources,
+}
+
+impl SourcePolicy {
+    /// Accept ordinary local HTML and CSS while rejecting executable or dialect-specific input.
+    #[must_use]
+    pub const fn pure_html() -> Self {
+        Self {
+            extension_attributes: ExtensionAttributes::Forbid,
+            scripts: Scripts::Forbid,
+            remote_resources: RemoteResources::Forbid,
+        }
     }
 }
 
@@ -625,11 +714,13 @@ fn job_runner_from_parallelism(
 }
 
 fn resource_resolver_from_options(options: &CompilerOptions) -> Arc<dyn ResourceResolver> {
-    if !options.resources.resolve_remote && !options.resources.resolve_files {
+    let resolve_remote = options.resources.resolve_remote
+        && options.source_policy.remote_resources == RemoteResources::Allow;
+    if !resolve_remote && !options.resources.resolve_files {
         return Arc::new(NoopResourceResolver::new());
     }
 
-    let http = options.resources.resolve_remote.then(|| {
+    let http = resolve_remote.then(|| {
         HttpResourceResolver::new(HttpResourceResolverOptions::new(
             options.resources.timeout,
             options.resources.max_bytes,
@@ -665,6 +756,7 @@ pub(crate) fn compile_fragment_with_sources(
         &JobContext::default(),
         resolver.as_ref(),
         &Frontend::default(),
+        &StyleProviderPipeline::new(),
     )
 }
 
@@ -675,6 +767,7 @@ fn compile_fragment_with_jobs(
     jobs: &JobContext,
     resolver: &dyn ResourceResolver,
     frontend: &Frontend,
+    style_providers: &StyleProviderPipeline,
 ) -> Compilation<CompiledFragment> {
     compile_fragment_with_jobs_and_cache(
         name,
@@ -684,8 +777,10 @@ fn compile_fragment_with_jobs(
         resolver,
         frontend,
         SourceFrontendKind::Html,
+        SourcePolicy::default(),
         &BundleConfig::default(),
         None,
+        style_providers,
     )
 }
 
@@ -701,13 +796,21 @@ fn compile_fragment_with_jobs_and_cache(
     resolver: &dyn ResourceResolver,
     frontend: &Frontend,
     source_frontend: SourceFrontendKind,
+    source_policy: SourcePolicy,
     bundle: &BundleConfig,
     cache: Option<&CompilerCache>,
+    style_providers: &StyleProviderPipeline,
 ) -> Compilation<CompiledFragment> {
     let mut sources = SourceMap::new();
     if source_frontend == SourceFrontendKind::Jsx {
         let jsx_id = sources.add_file(SourceKind::JavaScript, name, source);
         let mut diagnostics = Diagnostics::new();
+        if !style_providers.is_empty() {
+            diagnostics.push(Diagnostic::error(
+                "style providers require an HTML-based source frontend; JSX provider expansion is not supported",
+                None,
+            ));
+        }
         if jobs.cancel().is_cancelled() {
             return cancelled_compilation(sources, diagnostics);
         }
@@ -772,6 +875,20 @@ fn compile_fragment_with_jobs_and_cache(
         return cancelled_compilation(sources, diagnostics);
     }
 
+    diagnostics.extend(validate_source_policy(&parsed.value, assets, source_policy));
+    if diagnostics.has_errors() {
+        let plan = RenderPlan::new(Vec::new());
+        let bundle = BundlePlan::from_render_plan_with_config(&plan, &sources, bundle);
+        return Compilation::new(
+            CompiledFragment {
+                plan,
+                sources,
+                bundle,
+            },
+            diagnostics,
+        );
+    }
+
     if resolve_linked_stylesheet_sources(
         &parsed.value,
         &mut stylesheet_ids,
@@ -790,7 +907,54 @@ fn compile_fragment_with_jobs_and_cache(
         return cancelled_compilation(sources, diagnostics);
     }
 
-    let mut annotations = Vec::new();
+    let classes = ClassIndex::collect(&parsed.value, html_id);
+    let expanded_styles = style_providers.expand(StyleProviderInput {
+        sources: &sources,
+        document: &parsed.value,
+        classes: &classes,
+        resources: resolver,
+    });
+    diagnostics.extend(expanded_styles.diagnostics);
+
+    let mut annotations = expanded_styles.value.annotations;
+    for annotation in &mut annotations {
+        if annotation
+            .span
+            .is_some_and(|span| sources.source_text(span).is_none())
+        {
+            diagnostics.push(Diagnostic::warning(
+                "style provider returned an annotation with an invalid source span",
+                None,
+            ));
+            annotation.span = None;
+        }
+    }
+    for stylesheet in expanded_styles.value.stylesheets {
+        if sources
+            .files()
+            .iter()
+            .any(|source| source.name() == Some(stylesheet.name.as_str()))
+        {
+            diagnostics.push(Diagnostic::error(
+                format!(
+                    "generated stylesheet source `{}` conflicts with an existing source name",
+                    stylesheet.name
+                ),
+                None,
+            ));
+            continue;
+        }
+
+        stylesheet_ids.push(sources.add_file(
+            SourceKind::Css,
+            Some(stylesheet.name),
+            stylesheet.contents,
+        ));
+    }
+    if jobs.cancel().is_cancelled() {
+        return cancelled_compilation(sources, diagnostics);
+    }
+
     let lowered = {
         let mut styles = StyleIndex::new();
         if parse_stylesheet_graph(
@@ -931,6 +1095,131 @@ fn compile_fragment_with_jobs_and_cache(
         },
         diagnostics,
     )
+}
+
+fn validate_source_policy(
+    document: &HtmlDocument,
+    assets: &CompileAssets,
+    policy: SourcePolicy,
+) -> Diagnostics {
+    let mut diagnostics = Diagnostics::new();
+    validate_policy_nodes(&document.nodes, policy, &mut diagnostics);
+
+    if policy.scripts == Scripts::Forbid {
+        diagnostics.extend(
+            assets
+                .scripts
+                .iter()
+                .map(|script| {
+                    Diagnostic::error(
+                        format!(
+                            "pure HTML policy forbids script asset `{}`",
+                            script.name.as_deref().unwrap_or("<unnamed>")
+                        ),
+                        None,
+                    )
+                })
+                .collect(),
+        );
+    }
+    if policy.remote_resources == RemoteResources::Forbid {
+        diagnostics.extend(
+            assets
+                .stylesheets
+                .iter()
+                .filter(|stylesheet| contains_remote_reference(&stylesheet.contents))
+                .map(|stylesheet| {
+                    Diagnostic::error(
+                        format!(
+                            "pure HTML policy forbids remote reference in stylesheet `{}`",
+                            stylesheet.name.as_deref().unwrap_or("<unnamed>")
+                        ),
+                        None,
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    diagnostics
+}
+
+fn validate_policy_nodes(nodes: &[HtmlNode], policy: SourcePolicy, diagnostics: &mut Diagnostics) {
+    for node in nodes {
+        let HtmlNode::Element(element) = node else {
+            continue;
+        };
+        let tag = element.name.local();
+
+        if policy.scripts == Scripts::Forbid
+            && matches!(tag, "script" | "iframe" | "object" | "embed")
+        {
+            diagnostics.push(Diagnostic::error(
+                format!("pure HTML policy forbids active `<{tag}>` elements"),
+                element.span,
+            ));
+        }
+
+        for attribute in &element.attributes {
+            let name = attribute.name.local();
+            if policy.extension_attributes == ExtensionAttributes::Forbid
+                && name.starts_with("data-htmlswap-")
+            {
+                diagnostics.push(Diagnostic::error(
+                    format!("pure HTML policy forbids extension attribute `{name}`"),
+                    attribute.span,
+                ));
+            }
+            if policy.scripts == Scripts::Forbid
+                && ((name.starts_with("on") && name.len() > 2)
+                    || attribute
+                        .value
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("javascript:"))
+            {
+                diagnostics.push(Diagnostic::error(
+                    format!("pure HTML policy forbids executable attribute `{name}`"),
+                    attribute.span,
+                ));
+            }
+            if policy.remote_resources == RemoteResources::Forbid
+                && contains_remote_reference(&attribute.value)
+            {
+                diagnostics.push(Diagnostic::error(
+                    format!("pure HTML policy forbids remote reference in `{name}`"),
+                    attribute.span,
+                ));
+            }
+        }
+
+        if policy.remote_resources == RemoteResources::Forbid
+            && tag == "style"
+            && element.children.iter().any(|child| {
+                matches!(child, HtmlNode::Text(text) if contains_remote_reference(&text.value))
+            })
+        {
+            diagnostics.push(Diagnostic::error(
+                "pure HTML policy forbids remote reference in `<style>`",
+                element.span,
+            ));
+        }
+
+        validate_policy_nodes(&element.children, policy, diagnostics);
+    }
+}
+
+fn contains_remote_reference(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '(' | ')' | '\'' | '"' | ',' | ';')
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            let token = token.to_ascii_lowercase();
+            token.starts_with("http:") || token.starts_with("https:") || token.starts_with("//")
+        })
 }
 
 fn parse_html_with_source(source: &str, source_id: SourceId) -> Compilation<HtmlDocument> {

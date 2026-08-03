@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use compact_str::CompactString;
 use heck::ToLowerCamelCase;
 use oxc_allocator::Allocator;
@@ -50,7 +52,7 @@ impl AttributeRewrite {
 }
 
 pub trait SourceDialect: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     fn rewrite_attribute(
         &self,
@@ -94,8 +96,9 @@ pub trait SourceDialect: Send + Sync {
     }
 }
 
+#[derive(Clone)]
 pub struct Frontend {
-    dialects: Vec<Box<dyn SourceDialect>>,
+    dialects: Vec<Arc<dyn SourceDialect>>,
 }
 
 impl Frontend {
@@ -123,12 +126,26 @@ impl Frontend {
 
     #[must_use]
     pub fn with_dialect(mut self, dialect: impl SourceDialect + 'static) -> Self {
-        self.dialects.push(Box::new(dialect));
+        self.push_dialect(dialect);
         self
     }
 
     #[must_use]
-    pub fn dialects(&self) -> &[Box<dyn SourceDialect>] {
+    pub fn with_dialect_arc(mut self, dialect: Arc<dyn SourceDialect>) -> Self {
+        self.push_dialect_arc(dialect);
+        self
+    }
+
+    pub fn push_dialect(&mut self, dialect: impl SourceDialect + 'static) {
+        self.push_dialect_arc(Arc::new(dialect));
+    }
+
+    pub fn push_dialect_arc(&mut self, dialect: Arc<dyn SourceDialect>) {
+        self.dialects.push(dialect);
+    }
+
+    #[must_use]
+    pub fn dialects(&self) -> &[Arc<dyn SourceDialect>] {
         &self.dialects
     }
 
@@ -271,7 +288,7 @@ impl ElementDirectives {
 pub struct DcDialect;
 
 impl SourceDialect for DcDialect {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "dc"
     }
 
@@ -558,7 +575,7 @@ fn preceding_significant_comment(
 pub struct VueDialect;
 
 impl SourceDialect for VueDialect {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "vue"
     }
 

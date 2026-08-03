@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arcstr::ArcStr;
@@ -116,9 +117,93 @@ impl ResourceSource {
 }
 
 pub trait ResourceResolver: Send + Sync {
+    fn name(&self) -> &str {
+        std::any::type_name::<Self>()
+    }
+
     fn can_resolve(&self, request: &ResourceRequest) -> bool;
 
     fn resolve(&self, request: &ResourceRequest) -> Compilation<Option<ResourceSource>>;
+}
+
+/// An ordered resolver chain where the first capable resolver owns a request.
+#[derive(Clone, Default)]
+pub struct ResourceResolverChain {
+    resolvers: Vec<Arc<dyn ResourceResolver>>,
+}
+
+impl ResourceResolverChain {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: impl ResourceResolver + 'static) -> Self {
+        self.push(resolver);
+        self
+    }
+
+    #[must_use]
+    pub fn with_resolver_arc(mut self, resolver: Arc<dyn ResourceResolver>) -> Self {
+        self.push_arc(resolver);
+        self
+    }
+
+    pub fn push(&mut self, resolver: impl ResourceResolver + 'static) {
+        self.push_arc(Arc::new(resolver));
+    }
+
+    pub fn push_arc(&mut self, resolver: Arc<dyn ResourceResolver>) {
+        self.resolvers.push(resolver);
+    }
+
+    #[must_use]
+    pub fn resolvers(&self) -> &[Arc<dyn ResourceResolver>] {
+        &self.resolvers
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.resolvers.is_empty()
+    }
+}
+
+impl fmt::Debug for ResourceResolverChain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourceResolverChain")
+            .field(
+                "resolvers",
+                &self
+                    .resolvers
+                    .iter()
+                    .map(|resolver| resolver.name())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl ResourceResolver for ResourceResolverChain {
+    fn name(&self) -> &str {
+        "resolver-chain"
+    }
+
+    fn can_resolve(&self, request: &ResourceRequest) -> bool {
+        self.resolvers
+            .iter()
+            .any(|resolver| resolver.can_resolve(request))
+    }
+
+    fn resolve(&self, request: &ResourceRequest) -> Compilation<Option<ResourceSource>> {
+        self.resolvers
+            .iter()
+            .find(|resolver| resolver.can_resolve(request))
+            .map_or_else(
+                || Compilation::clean(None),
+                |resolver| resolver.resolve(request),
+            )
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

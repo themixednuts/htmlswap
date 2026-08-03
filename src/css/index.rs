@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use compact_str::CompactString;
 
 use crate::plan::{
@@ -30,13 +32,21 @@ impl StyleIndex {
     #[must_use]
     pub(crate) fn styles_for_element(&self, element: &StyleElement<'_, '_>) -> ElementStyles {
         let mut applied = Vec::<AppliedDeclaration>::new();
+        let mut applied_variants = Vec::<AppliedVariant>::new();
+        let mut conditional_winners = HashMap::<ConditionalProperty, ConditionalWinner>::new();
         let mut declaration_order = 0usize;
         let mut matched_rules = Vec::new();
-        let mut variants = Vec::new();
 
         for (rule_source_order, rule) in self.rules.iter().enumerate() {
-            if let Some(variant) = variant_for_rule(rule, element) {
-                variants.push(variant);
+            let rule_declaration_order = declaration_order;
+            declaration_order += rule.declarations.len();
+            for matched in conditional_matches_for_rule(rule, element) {
+                apply_conditional_match(
+                    matched,
+                    rule_declaration_order,
+                    &mut applied_variants,
+                    &mut conditional_winners,
+                );
             }
 
             if !rule.conditions.is_empty() {
@@ -44,7 +54,6 @@ impl StyleIndex {
             }
 
             let Some(specificity) = rule.selector.matching_specificity(element) else {
-                declaration_order += rule.declarations.len();
                 continue;
             };
 
@@ -56,13 +65,13 @@ impl StyleIndex {
                 span: rule.span,
             });
 
-            for declaration in &rule.declarations {
+            for (declaration_index, declaration) in rule.declarations.iter().enumerate() {
                 let candidate = AppliedDeclaration {
                     declaration: declaration.clone(),
                     key: CascadeKey {
                         important: declaration.important,
                         specificity,
-                        source_order: declaration_order,
+                        source_order: rule_declaration_order + declaration_index,
                     },
                 };
 
@@ -76,10 +85,13 @@ impl StyleIndex {
                 } else {
                     applied.push(candidate);
                 }
-
-                declaration_order += 1;
             }
         }
+
+        let variants = applied_variants
+            .into_iter()
+            .filter_map(AppliedVariant::finish)
+            .collect();
 
         ElementStyles {
             declarations: applied
@@ -124,25 +136,165 @@ pub(crate) struct ElementStyles {
     pub(crate) variants: Vec<RenderStyleVariant>,
 }
 
-fn variant_for_rule(rule: &CssRule, element: &StyleElement<'_, '_>) -> Option<RenderStyleVariant> {
+fn conditional_matches_for_rule(
+    rule: &CssRule,
+    element: &StyleElement<'_, '_>,
+) -> Vec<ConditionalMatch> {
     if !rule.selector.has_static_anchor() {
-        return None;
+        return Vec::new();
     }
 
-    let mut conditions = rule.conditions.clone();
-
-    if let Some(dynamic_conditions) = rule.selector.matching_dynamic_conditions(element) {
+    let mut matches = Vec::new();
+    for (specificity, dynamic_conditions) in rule.selector.matching_dynamic_branches(element) {
+        let mut conditions = rule.conditions.clone();
         extend_unique_conditions(&mut conditions, dynamic_conditions);
-    } else if rule.conditions.is_empty() || rule.selector.matching_specificity(element).is_none() {
-        return None;
+        push_conditional_match(
+            &mut matches,
+            conditional_match(rule, conditions, specificity),
+        );
     }
+    if !rule.conditions.is_empty()
+        && let Some(specificity) = rule.selector.matching_specificity(element)
+    {
+        push_conditional_match(
+            &mut matches,
+            conditional_match(rule, rule.conditions.clone(), specificity),
+        );
+    }
+    matches
+}
 
-    (!conditions.is_empty()).then(|| RenderStyleVariant {
-        conditions,
-        selector: CompactString::from(rule.selector.raw.as_str()),
-        declarations: rule.declarations.clone(),
-        span: rule.span,
-    })
+fn conditional_match(
+    rule: &CssRule,
+    conditions: Vec<RenderStyleCondition>,
+    specificity: u32,
+) -> ConditionalMatch {
+    ConditionalMatch {
+        specificity,
+        variant: RenderStyleVariant {
+            conditions,
+            selector: CompactString::from(rule.selector.raw.as_str()),
+            declarations: rule.declarations.clone(),
+            span: rule.span,
+        },
+    }
+}
+
+fn push_conditional_match(matches: &mut Vec<ConditionalMatch>, candidate: ConditionalMatch) {
+    if let Some(existing) = matches.iter_mut().find(|existing| {
+        condition_key(&existing.variant.conditions) == condition_key(&candidate.variant.conditions)
+    }) {
+        if candidate.specificity > existing.specificity {
+            *existing = candidate;
+        }
+    } else {
+        matches.push(candidate);
+    }
+}
+
+fn apply_conditional_match(
+    matched: ConditionalMatch,
+    source_order: usize,
+    variants: &mut Vec<AppliedVariant>,
+    winners: &mut HashMap<ConditionalProperty, ConditionalWinner>,
+) {
+    let variant_index = variants.len();
+    let condition = condition_key(&matched.variant.conditions);
+    let mut declarations = Vec::with_capacity(matched.variant.declarations.len());
+    for (declaration_index, declaration) in matched.variant.declarations.iter().enumerate() {
+        let key = CascadeKey {
+            important: declaration.important,
+            specificity: matched.specificity,
+            source_order: source_order + declaration_index,
+        };
+        let property = ConditionalProperty {
+            condition: condition.clone(),
+            property: declaration.property.clone(),
+        };
+        let winner = ConditionalWinner {
+            variant_index,
+            declaration_index: declarations.len(),
+            key,
+        };
+        let should_apply = winners
+            .get(&property)
+            .is_none_or(|existing| key.wins_over(existing.key));
+        if should_apply {
+            if let Some(existing) = winners.insert(property, winner) {
+                variants[existing.variant_index].declarations[existing.declaration_index] = None;
+            }
+            declarations.push(Some(declaration.clone()));
+        } else {
+            declarations.push(None);
+        }
+    }
+    variants.push(AppliedVariant {
+        variant: matched.variant,
+        declarations,
+    });
+}
+
+fn condition_key(conditions: &[RenderStyleCondition]) -> Vec<ConditionPart> {
+    let mut key = conditions
+        .iter()
+        .map(ConditionPart::from)
+        .collect::<Vec<_>>();
+    key.sort_unstable();
+    key.dedup();
+    key
+}
+
+#[derive(Clone, Debug)]
+struct ConditionalMatch {
+    variant: RenderStyleVariant,
+    specificity: u32,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedVariant {
+    variant: RenderStyleVariant,
+    declarations: Vec<Option<StyleDeclaration>>,
+}
+
+impl AppliedVariant {
+    fn finish(mut self) -> Option<RenderStyleVariant> {
+        self.variant.declarations = self.declarations.into_iter().flatten().collect();
+        (!self.variant.declarations.is_empty()).then_some(self.variant)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ConditionalWinner {
+    variant_index: usize,
+    declaration_index: usize,
+    key: CascadeKey,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ConditionalProperty {
+    condition: Vec<ConditionPart>,
+    property: StyleProperty,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum ConditionPart {
+    PseudoClass(CompactString),
+    PseudoElement(CompactString),
+    Media(CompactString),
+    Supports(CompactString),
+    Container(CompactString),
+}
+
+impl From<&RenderStyleCondition> for ConditionPart {
+    fn from(condition: &RenderStyleCondition) -> Self {
+        match condition {
+            RenderStyleCondition::PseudoClass(value) => Self::PseudoClass(value.clone()),
+            RenderStyleCondition::PseudoElement(value) => Self::PseudoElement(value.clone()),
+            RenderStyleCondition::Media(value) => Self::Media(value.clone()),
+            RenderStyleCondition::Supports(value) => Self::Supports(value.clone()),
+            RenderStyleCondition::Container(value) => Self::Container(value.clone()),
+        }
+    }
 }
 
 fn extend_unique_conditions(

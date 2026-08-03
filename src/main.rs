@@ -12,12 +12,13 @@ use htmlswap::{
     Adapter, AdapterArtifact, AdapterContext, AdapterError, ArtifactBuilder, CompileAssets,
     CompiledFragment, Compiler, CompilerBuildError, CompilerCache, CompilerCacheFileSet,
     CompilerOptions, CompilerParallelism, CompilerResourceOptions, DEFAULT_RESOURCE_MAX_BYTES,
-    DcComponentFragment, Diagnostics, EmitContext, EmitError, Emitter, Frontend, GeneratedFile,
-    GpuiAdapter, GpuiAdapterOptions, GpuiComponentsAdapter, GpuiComponentsAdapterOptions, Importer,
-    LayerId, LayoutDebugOptions, RenderNode, RenderPlan, RoundTripComparison, RoundTripOptions,
-    RouteConfig, RouteTarget, RustFormatOptions, SourceAsset, SourceFrontendKind, SourceMap,
-    StyleProperty, SvelteAdapter, SvelteAdapterOptions, TargetArtifact, TextEmitter, ThemeEmission,
-    UiRole, compare_roundtrip_plans, inline_dc_component_imports,
+    DEFAULT_TAILWIND_MAX_OUTPUT_BYTES, DEFAULT_TAILWIND_TIMEOUT, DcComponentFragment, Diagnostics,
+    EmitContext, EmitError, Emitter, Frontend, GeneratedFile, GpuiAdapter, GpuiAdapterOptions,
+    GpuiComponentsAdapter, GpuiComponentsAdapterOptions, Importer, LayerId, LayoutDebugOptions,
+    RenderNode, RenderPlan, RoundTripComparison, RoundTripOptions, RouteConfig, RouteTarget,
+    RustFormatOptions, Severity, SourceAsset, SourceFrontendKind, SourceMap, StyleProperty,
+    SvelteAdapter, SvelteAdapterOptions, TailwindCli, TailwindProvider, TargetArtifact,
+    TextEmitter, ThemeEmission, UiRole, compare_roundtrip_plans, inline_dc_component_imports,
     instrument_layout_snapshot_html_with_sources,
 };
 const DEFAULT_RESOURCE_TIMEOUT_MS: u64 = 10_000;
@@ -68,6 +69,43 @@ struct CompileCommand {
     /// External JavaScript or TypeScript file. May be passed multiple times.
     #[arg(long = "js", value_name = "PATH")]
     scripts: Vec<PathBuf>,
+
+    /// Expand literal class names with a preinstalled Tailwind CSS v4 CLI.
+    #[arg(long)]
+    tailwind: bool,
+
+    /// Tailwind v4 CLI executable or shim. htmlswap never installs packages.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "tailwindcss",
+        requires = "tailwind"
+    )]
+    tailwind_cli: PathBuf,
+
+    /// Argument placed before htmlswap's Tailwind CLI build arguments. May be repeated.
+    #[arg(long, value_name = "ARG", requires = "tailwind")]
+    tailwind_cli_arg: Vec<String>,
+
+    /// CSS-first Tailwind configuration file. Defaults to an isolated standard theme build.
+    #[arg(long, value_name = "PATH", requires = "tailwind")]
+    tailwind_css: Option<PathBuf>,
+
+    /// Tailwind subprocess timeout in milliseconds.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TAILWIND_TIMEOUT.as_millis() as u64,
+        requires = "tailwind"
+    )]
+    tailwind_timeout_ms: u64,
+
+    /// Maximum generated Tailwind CSS size in bytes.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TAILWIND_MAX_OUTPUT_BYTES,
+        requires = "tailwind"
+    )]
+    tailwind_max_bytes: usize,
 
     /// Output path. Omit to write to stdout.
     #[arg(short, long, value_name = "PATH", conflicts_with = "out_dir")]
@@ -182,7 +220,27 @@ impl CompileCommand {
                     .with_max_bytes(self.resource_max_bytes),
             )
             .with_source_frontend(self.source.source_frontend());
-        let compiler = Compiler::try_with_options(options)?.with_frontend(self.source.frontend());
+        let mut compiler =
+            Compiler::try_with_options(options)?.with_frontend(self.source.frontend());
+        if self.tailwind {
+            let mut cli = TailwindCli::new(&self.tailwind_cli)
+                .with_arguments(self.tailwind_cli_arg.iter().map(String::as_str))
+                .with_timeout(Duration::from_millis(self.tailwind_timeout_ms))
+                .with_max_output_bytes(self.tailwind_max_bytes);
+            let stylesheet = if let Some(path) = &self.tailwind_css {
+                if let Some(parent) = path.parent() {
+                    cli = cli.with_working_directory(parent);
+                }
+                Some(read_to_string(path)?)
+            } else {
+                None
+            };
+            let mut provider = TailwindProvider::new(cli);
+            if let Some(stylesheet) = stylesheet {
+                provider = provider.with_stylesheet(stylesheet);
+            }
+            compiler = compiler.with_style_provider(provider);
+        }
         Ok(match cache {
             Some(cache) => compiler.with_cache(cache),
             None => compiler,
@@ -205,6 +263,7 @@ impl CompileCommand {
         let source_name = self.input_path().map(source_name_for_path);
         let compiled = compiler.compile_fragment_named(source_name, source, &assets);
         print_diagnostics(&compiled.diagnostics, &compiled.value.sources);
+        ensure_compilation_succeeded(&compiled.diagnostics)?;
 
         let artifact = if self.source == SourceFrontendKindArg::Dc {
             if let Some(input_path) = self.input_path() {
@@ -238,6 +297,7 @@ impl CompileCommand {
         }
         let compiled = compiler.compile_jsx_svelte_project(sources, self.svelte_options());
         print_diagnostics(&compiled.diagnostics, &SourceMap::new());
+        ensure_compilation_succeeded(&compiled.diagnostics)?;
         Ok(compiled.value)
     }
 
@@ -310,6 +370,7 @@ impl CompileCommand {
             let source_name = Some(source_name_for_path(&path));
             let compiled = compiler.compile_fragment_named(source_name, source, assets);
             print_diagnostics(&compiled.diagnostics, &compiled.value.sources);
+            ensure_compilation_succeeded(&compiled.diagnostics)?;
 
             let component_name = path
                 .file_name()
@@ -441,6 +502,7 @@ impl CompileCommand {
             .into_iter()
             .chain(self.stylesheets.iter().map(PathBuf::as_path))
             .chain(self.scripts.iter().map(PathBuf::as_path))
+            .chain(self.tailwind_css.iter().map(PathBuf::as_path))
             .map(Path::to_path_buf)
             .collect()
     }
@@ -496,6 +558,7 @@ impl LayoutSnapshotCommand {
         let source_name = self.input_path().map(source_name_for_path);
         let compiled = compiler.compile_fragment_named(source_name, source.clone(), &assets);
         print_diagnostics(&compiled.diagnostics, &compiled.value.sources);
+        ensure_compilation_succeeded(&compiled.diagnostics)?;
 
         let output = instrument_layout_snapshot_html_with_sources(
             &source,
@@ -633,6 +696,8 @@ impl RoundtripCheckCommand {
         );
         print_diagnostics(&expected.diagnostics, &expected.value.sources);
         print_diagnostics(&actual.diagnostics, &actual.value.sources);
+        ensure_compilation_succeeded(&expected.diagnostics)?;
+        ensure_compilation_succeeded(&actual.diagnostics)?;
 
         let expected = if self.source == SourceFrontendKindArg::Dc {
             compile_dc_bundle(&compiler, &self.expected, &assets, &expected.value)?
@@ -804,6 +869,8 @@ enum CliError {
     WatchRequiresFileInput,
     #[error("compiler setup failed: {0}")]
     CompilerBuild(#[from] CompilerBuildError),
+    #[error("compilation failed with {errors} error diagnostic(s)")]
+    CompilationFailed { errors: usize },
     #[error("emit failed: {0}")]
     Emit(EmitError),
     #[error("adapter failed: {0}")]
@@ -884,6 +951,7 @@ fn compile_dc_bundle(
         let source_name = Some(source_name_for_path(&path));
         let compiled = compiler.compile_fragment_named(source_name, source, assets);
         print_diagnostics(&compiled.diagnostics, &compiled.value.sources);
+        ensure_compilation_succeeded(&compiled.diagnostics)?;
 
         let component_name = path
             .file_name()
@@ -1065,5 +1133,17 @@ fn print_diagnostics(diagnostics: &Diagnostics, sources: &SourceMap) {
             continue;
         }
         eprintln!("{}: {}", diagnostic.severity, diagnostic.message);
+    }
+}
+
+fn ensure_compilation_succeeded(diagnostics: &Diagnostics) -> Result<(), CliError> {
+    let errors = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .count();
+    if errors == 0 {
+        Ok(())
+    } else {
+        Err(CliError::CompilationFailed { errors })
     }
 }

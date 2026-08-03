@@ -2164,6 +2164,9 @@ fn inline_style_block(element: &RenderElement) -> Option<String> {
 }
 
 fn svelte_inline_styles(element: &RenderElement) -> Vec<&StyleDeclaration> {
+    if !element.source_inline_styles.is_empty() {
+        return element.source_inline_styles.iter().collect();
+    }
     element
         .styles
         .iter()

@@ -1,95 +1,126 @@
-# Tailwind Composition
+# Tailwind CSS v4
 
-Tailwind support should be modeled as a style expansion pass, not as a UI adapter.
-
-The compiler pipeline should stay shaped like this:
+htmlswap runs Tailwind CSS v4 as a style provider. Tailwind remains the CSS
+compiler; htmlswap consumes its generated CSS through the same Lightning CSS,
+cascade, theme-token, render-IR, and adapter pipeline used for authored CSS.
 
 ```text
-HTML, CSS, and JavaScript resources
-  -> parsers and source maps
-  -> class and source candidate collection
-  -> Tailwind style provider
-  -> generated CSS sources
-  -> Lightning CSS parsing
-  -> selector/style mapping onto render IR
-  -> target adapters such as GPUI and gpui-components
+HTML and resolved resources
+  -> literal class candidate collection
+  -> TailwindProvider
+  -> TailwindEngine (TailwindCli by default)
+  -> generated CSS source
+  -> Lightning CSS and cascade matching
+  -> target-neutral render IR
+  -> GPUI, gpui-components, Svelte, or another adapter
 ```
 
-Adapters should not need Tailwind-specific branches. GPUI and gpui-components should receive the same target-neutral style declarations, style variants, pseudo-elements, annotations, and source metadata they already consume for authored CSS.
+Adapters never contain Tailwind-specific branches.
 
-## Core Primitive
+## Why Tailwind Produces CSS
 
-Add a style provider abstraction that can contribute generated stylesheet sources before the existing stylesheet graph is parsed and matched.
+Tailwind v4 is a CSS-first build tool. Its supported CLI owns `@import`,
+`@theme`, `@source`, `@utility`, `@variant`, `@custom-variant`, `@apply`, legacy
+plugins, arbitrary values, and future Tailwind behavior. Reimplementing those
+semantics in htmlswap would create an incomplete second Tailwind compiler and
+would break project configuration and plugin compatibility.
 
-```rust
-pub trait StyleProvider {
-    fn expand(
-        &self,
-        input: StyleProviderInput<'_>,
-        cx: &mut CompileContext,
-    ) -> Compilation<StyleProviderOutput>;
-}
+The engine remains replaceable behind `TailwindEngine`, so a stable native
+Rust integration can be added later without changing `Compiler`,
+`TailwindProvider`, or adapter APIs.
 
-pub struct StyleProviderInput<'a> {
-    pub sources: &'a SourceMap,
-    pub document: &'a HtmlDocument,
-    pub classes: &'a ClassIndex,
-    pub resources: &'a dyn ResourceResolver,
-}
+## CLI
 
-pub struct StyleProviderOutput {
-    pub stylesheets: Vec<GeneratedStyleSource>,
-    pub annotations: Vec<RenderAnnotation>,
-}
+Install Tailwind CSS v4 and its CLI yourself, or download the official
+standalone executable. htmlswap never installs packages or invokes a shell.
+
+```text
+htmlswap compile view.html \
+  --tailwind \
+  --tailwind-cli ./node_modules/.bin/tailwindcss \
+  --adapter gpui
 ```
 
-`GeneratedStyleSource` should be registered in `SourceMap` with a stable source name, then parsed through Lightning CSS like any other stylesheet. This keeps cascade, source maps, comments, media queries, pseudo-classes, and pseudo-elements on the same path as authored CSS.
+Use a CSS-first configuration file when the default theme is not enough:
 
-## Tailwind Provider
-
-Tailwind should be one implementation of `StyleProvider`.
-
-```rust
-pub struct TailwindProvider {
-    pub config: TailwindConfigSource,
-    pub safelist: Vec<String>,
-    pub source_mode: TailwindSourceMode,
-}
+```text
+htmlswap compile view.html \
+  --tailwind \
+  --tailwind-css ./src/app.css \
+  --tailwind-cli ./node_modules/.bin/tailwindcss
 ```
 
-The provider should collect candidates from:
+Relative `@import`, `@config`, `@plugin`, and `@source` paths resolve from the
+configuration file's directory. `--tailwind-cli-arg` can be repeated for a
+shim that needs prefix arguments. For example, an explicitly configured local
+package runner can be represented as an executable plus prefix arguments
+without shell parsing.
 
-- HTML `class` attributes, including each token span.
-- CSS or Tailwind directives that affect generation.
-- JavaScript string literals when configured to scan scripts.
-- Explicit safelist entries for generated class names that do not appear literally in source.
-- Explicit source roots or source files when the CLI expands compilation beyond the primary HTML graph.
+## Library API
 
-## Provenance
+```rust,no_run
+use std::time::Duration;
+use htmlswap::{
+    CompileAssets, Compiler, TailwindCli, TailwindProvider,
+};
 
-Tailwind expands one source token into generated CSS, so a single declaration span is not enough for high-quality diagnostics and target source maps. The style IR should grow a richer origin model:
+let cli = TailwindCli::new("./node_modules/.bin/tailwindcss")
+    .with_working_directory("./")
+    .with_timeout(Duration::from_secs(20));
+let tailwind = TailwindProvider::new(cli)
+    .with_stylesheet("@import \"tailwindcss\" source(none);")
+    .with_safelist(["sr-only", "motion-safe:animate-spin"]);
+let compilation = Compiler::new()
+    .with_style_provider(tailwind)
+    .compile_fragment(
+        r#"<main class="flex gap-4"></main>"#,
+        &CompileAssets::new(),
+    );
 
-```rust
-pub struct StyleOrigin {
-    pub declaration_span: Option<Span>,
-    pub selector_span: Option<Span>,
-    pub candidate_span: Option<Span>,
-}
+assert!(!compilation.diagnostics.has_errors());
 ```
 
-Authored CSS can populate declaration and selector spans. Tailwind output should additionally point `candidate_span` at the original class token that caused the generated declaration.
+The default stylesheet uses `source(none)` and supplies the parsed HTML class
+tokens as an explicit isolated source. This avoids accidentally scanning the
+whole repository. A custom stylesheet may opt into Tailwind's automatic
+project scanning or add explicit `@source` directives.
 
-## Escape Hatches
+## Hardening
 
-Tailwind needs first-class escape hatches because many projects generate class names dynamically.
+- Providers execute in registration order and generated sources participate in
+  normal CSS source order.
+- Provider names and generated source names must be non-empty and unique.
+- Output from a provider that reports an error is discarded.
+- Generated sources cannot shadow authored source names.
+- Tailwind is invoked directly without a shell.
+- Candidate input and generated output are byte-bounded.
+- Diagnostics are captured with a bounded size.
+- A timed-out Tailwind process is killed.
+- Candidate and output files live in an isolated temporary workspace.
+- Tailwind is disabled unless the caller registers the provider or passes
+  `--tailwind`.
 
-- `safelist`: explicit class candidates to always generate.
-- `source_roots`: extra files or directories to scan for candidates.
-- `source_mode`: whether to scan only the HTML graph or the broader project.
-- `config`: file path, inline config, or default config.
+Treat Tailwind configuration and JavaScript plugins as trusted build input:
+Tailwind itself may load and execute them.
 
-Adapters should still receive plain render IR. Tailwind-specific metadata should remain in source maps, annotations, and style provenance.
+## Current Scope
 
-## Non-Goal
+Tailwind style-provider expansion currently requires an HTML-based source
+frontend. JSX compilation rejects registered style providers explicitly rather
+than silently ignoring them.
 
-Do not add Tailwind logic to GPUI or gpui-components adapters. If Tailwind support requires adapter-specific behavior, that is a sign the core style IR is missing a primitive.
+Literal HTML class tokens and explicit safelist entries are always supplied.
+Dynamic class construction still needs complete class names in a safelist or an
+explicit project source, matching Tailwind's own static detection model.
+
+The generated CSS can use modern CSS and custom properties. htmlswap preserves
+unsupported declarations and emits adapter diagnostics instead of inventing
+Tailwind-specific fallbacks. Extending native target coverage belongs in the
+core CSS/theme IR, not in `TailwindProvider`.
+
+## References
+
+- Tailwind CLI: https://tailwindcss.com/docs/installation/tailwind-cli
+- Detecting classes: https://tailwindcss.com/docs/detecting-classes-in-source-files
+- Functions and directives: https://tailwindcss.com/docs/functions-and-directives
+- Compatibility: https://tailwindcss.com/docs/compatibility

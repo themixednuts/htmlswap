@@ -319,10 +319,12 @@ fn write_html_attributes(output: &mut String, element: &RenderElement) {
 
 fn html_style_attribute_value(element: &RenderElement) -> Option<String> {
     let mut parts = Vec::new();
-    if !element.styles.is_empty() {
+    if !element.source_inline_styles.is_empty() {
+        parts.push(format_html_styles(&element.source_inline_styles));
+    } else if !element.styles.is_empty() {
         parts.push(format_html_styles(&element.styles));
     }
-    if element.styles.is_empty() {
+    if element.source_inline_styles.is_empty() && element.styles.is_empty() {
         parts.extend(
             element
                 .dynamic_styles

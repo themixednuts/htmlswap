@@ -63,11 +63,39 @@ htmlswap compile src/view.dc.html --source dc --adapter text
 htmlswap compile src/view.dc.html --source dc --adapter gpui --watch -o view.rs
 htmlswap import view.rs --adapter gpui -o recovered.html
 htmlswap layout-snapshot input.html -o debug.html
+
+# Tailwind CSS v4 through a preinstalled CLI
+htmlswap compile src/view.html --tailwind \
+  --tailwind-cli ./node_modules/.bin/tailwindcss \
+  --adapter gpui -o view.rs
 ```
 
 Or from a `build.rs` (see `examples/gpui_smoke/`): compile with
 `Frontend::dc()` + `GpuiComponentsAdapter`, write to `OUT_DIR`, and
 `include!` the generated file.
+
+Tailwind remains the authoritative CSS transformer; htmlswap feeds its output
+through the ordinary CSS and render-IR pipeline. See
+[docs/tailwind.md](docs/tailwind.md). The capability-based Rust extension model
+is documented in [docs/plugins.md](docs/plugins.md).
+
+## Fail-closed pure HTML policy
+
+Embedders that need ordinary HTML without htmlswap's extension dialect can
+select `SourcePolicy::pure_html()`:
+
+```rust,ignore
+let compiler = Compiler::try_with_options(
+    CompilerOptions::new().with_source_policy(SourcePolicy::pure_html()),
+)?;
+let compilation = compiler.compile_fragment(source, &assets);
+```
+
+This policy rejects `data-htmlswap-*`, scripts, inline event handlers,
+JavaScript URLs, embedded browsing/plugin elements, and remote resources before
+resource or script processing. If validation emits an error, compilation
+returns an empty render plan rather than exposing partially trusted output.
+The default policy remains extension-compatible for existing htmlswap users.
 
 ## The source dialect in 30 seconds
 
