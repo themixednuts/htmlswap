@@ -878,6 +878,10 @@ fn pseudo_class_matches(
     element: &StyleElement<'_, '_>,
     allow_dynamic: bool,
 ) -> bool {
+    #[allow(
+        unreachable_patterns,
+        reason = "lightningcss adds pseudo variants in compatible alpha releases"
+    )]
     match pseudo_class {
         PseudoClass::Lang { languages } => {
             inherited_attribute(element, "lang").is_some_and(|lang| {
@@ -932,6 +936,9 @@ fn pseudo_class_matches(
         | PseudoClass::Modal
         | PseudoClass::PictureInPicture
         | PseudoClass::Target
+        | PseudoClass::TargetCurrent
+        | PseudoClass::TargetBefore
+        | PseudoClass::TargetAfter
         | PseudoClass::TargetWithin
         | PseudoClass::Visited
         | PseudoClass::Default
@@ -950,6 +957,10 @@ fn pseudo_class_matches(
         | PseudoClass::WebKitScrollbar(_)
         | PseudoClass::Custom { .. }
         | PseudoClass::CustomFunction { .. } => allow_dynamic,
+        // New parser variants are unsupported until htmlswap can model their
+        // runtime state explicitly. Ignore them instead of applying the rule
+        // unconditionally or breaking consumers on a compatible parser update.
+        _ => false,
     }
 }
 
@@ -1037,6 +1048,10 @@ fn collect_component_dynamic_conditions(
 }
 
 fn pseudo_element_name(pseudo_element: &PseudoElement<'_>) -> Option<&'static str> {
+    #[allow(
+        unreachable_patterns,
+        reason = "lightningcss adds pseudo variants in compatible alpha releases"
+    )]
     match pseudo_element {
         PseudoElement::Before => Some("before"),
         PseudoElement::After => Some("after"),
@@ -1053,6 +1068,8 @@ fn pseudo_element_name(pseudo_element: &PseudoElement<'_>) -> Option<&'static st
         PseudoElement::CueRegionFunction { .. } => Some("cue-region"),
         PseudoElement::DetailsContent => Some("details-content"),
         PseudoElement::TargetText => Some("target-text"),
+        PseudoElement::SearchText => Some("search-text"),
+        PseudoElement::HighlightFunction { .. } => Some("highlight"),
         PseudoElement::ViewTransition => Some("view-transition"),
         PseudoElement::ViewTransitionGroup { .. } => Some("view-transition-group"),
         PseudoElement::ViewTransitionImagePair { .. } => Some("view-transition-image-pair"),
@@ -1066,6 +1083,9 @@ fn pseudo_element_name(pseudo_element: &PseudoElement<'_>) -> Option<&'static st
         PseudoElement::WebKitScrollbar(_) => Some("-webkit-scrollbar"),
         PseudoElement::Custom { .. } => Some("custom"),
         PseudoElement::CustomFunction { .. } => Some("custom-function"),
+        // Preserve forward compatibility with lightningcss while keeping
+        // unsupported generated boxes out of the target-neutral render plan.
+        _ => None,
     }
 }
 
@@ -1100,6 +1120,9 @@ fn dynamic_pseudo_class_name(pseudo_class: &PseudoClass<'_>) -> Option<&'static 
         PseudoClass::Modal => Some("modal"),
         PseudoClass::PictureInPicture => Some("picture-in-picture"),
         PseudoClass::Target => Some("target"),
+        PseudoClass::TargetCurrent => Some("target-current"),
+        PseudoClass::TargetBefore => Some("target-before"),
+        PseudoClass::TargetAfter => Some("target-after"),
         PseudoClass::TargetWithin => Some("target-within"),
         PseudoClass::Visited => Some("visited"),
         PseudoClass::Default => Some("default"),

@@ -2327,6 +2327,31 @@ fn conditional_css_rules_lower_to_style_variants() {
 }
 
 #[test]
+fn new_pseudo_elements_are_preserved_in_the_render_plan() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        ".primary::search-text { color: green; }\n.primary::highlight(note) { color: blue; }",
+    );
+    let compiled =
+        compile_fragment_with_assets(r#"<button class="primary">Save</button>"#, &assets);
+
+    assert!(compiled.diagnostics.is_empty());
+    let RenderNode::Element(button) = &compiled.value.nodes[0] else {
+        panic!("expected button element");
+    };
+    assert!(button.styles.is_empty());
+    assert!(button.style_variants.is_empty());
+    assert_eq!(button.pseudo_elements.len(), 2);
+    assert_eq!(button.pseudo_elements[0].kind, "search-text");
+    assert_eq!(button.pseudo_elements[0].selector, ".primary::search-text");
+    assert_eq!(button.pseudo_elements[1].kind, "highlight");
+    assert_eq!(
+        button.pseudo_elements[1].selector,
+        ".primary::highlight(note)"
+    );
+}
+
+#[test]
 fn pseudo_element_content_lowers_to_synthetic_children() {
     let assets = CompileAssets::new().with_stylesheet(
         Some("app.css".to_owned()),
