@@ -91,6 +91,22 @@ impl Easing {
         }
     }
 
+    fn to_css(self) -> EasingFunction {
+        match self {
+            Self::Linear => EasingFunction::Linear,
+            Self::CubicBezier(x1, y1, x2, y2) => EasingFunction::CubicBezier { x1, y1, x2, y2 },
+            Self::Steps(count, position) => EasingFunction::Steps {
+                count: i32::try_from(count).unwrap_or(i32::MAX),
+                position: match position {
+                    StepPosition::JumpStart => CssStepPosition::Start,
+                    StepPosition::JumpEnd => CssStepPosition::End,
+                    StepPosition::JumpNone => CssStepPosition::JumpNone,
+                    StepPosition::JumpBoth => CssStepPosition::JumpBoth,
+                },
+            },
+        }
+    }
+
     /// The eased output for an input progress, which is clamped to `0..=1`.
     ///
     /// The output may leave `0..=1` for cubic Béziers that overshoot.
@@ -626,6 +642,17 @@ fn fill(fill: &CssFillMode) -> FillMode {
     }
 }
 
+/// Serializes as CSS, for example `cubic-bezier(0.25, 0.1, 0.25, 1)`.
+impl std::fmt::Display for Easing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let css = self
+            .to_css()
+            .to_css_string(PrinterOptions::default())
+            .map_err(|_| std::fmt::Error)?;
+        f.write_str(&css)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -633,6 +660,20 @@ mod tests {
         TransitionProperty, animations, transitions,
     };
     use crate::style::StyleDeclaration;
+
+    #[test]
+    fn easing_serializes_as_css_that_parses_back() {
+        for easing in [
+            Easing::Linear,
+            Easing::EASE,
+            Easing::CubicBezier(0.1, -0.5, 0.9, 1.5),
+            Easing::Steps(4, StepPosition::JumpStart),
+            Easing::Steps(2, StepPosition::JumpBoth),
+        ] {
+            let css = easing.to_string();
+            assert_eq!(Easing::parse(&css), Some(easing), "{css}");
+        }
+    }
 
     fn declarations(pairs: &[(&str, &str)]) -> Vec<StyleDeclaration> {
         pairs
