@@ -23,9 +23,12 @@ use lightningcss::values::color::{CssColor, RGBA};
 
 use crate::style::{StyleDeclaration, StyleProperty};
 
+mod animatable;
 mod media;
 mod style;
 mod values;
+
+pub use animatable::{AnimatableProperty, AnimatedValue, Underlying};
 
 pub use media::MediaEnvironment;
 pub use style::{
