@@ -6,13 +6,16 @@ mod source_spans;
 use compact_str::CompactString;
 use lightningcss::declaration::DeclarationBlock;
 use lightningcss::properties::Property;
+use lightningcss::rules::keyframes::{KeyframeSelector, KeyframesName, KeyframesRule};
 use lightningcss::rules::style::StyleRule;
+use lightningcss::rules::view_transition::{Navigation, ViewTransitionProperty};
 use lightningcss::rules::{CssRule as LightningCssRule, CssRuleList};
 use lightningcss::selector::{
     Combinator, Component, Direction, PseudoClass, PseudoElement, Selector, SelectorList,
 };
 use lightningcss::stylesheet::{ParserOptions, PrinterOptions, StyleAttribute, StyleSheet};
 use lightningcss::traits::{IntoOwned, ToCss};
+use lightningcss::values::ident::NoneOrCustomIdentList;
 use parcel_selectors::attr::{
     AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation,
 };
@@ -20,7 +23,10 @@ use parcel_selectors::parser::NthType;
 
 use crate::diagnostics::{Compilation, Diagnostic, Diagnostics};
 use crate::ir::{HtmlDocument, HtmlElement, HtmlNode};
-use crate::plan::{RenderAnnotation, RenderAnnotationKind, RenderStyleCondition};
+use crate::plan::{
+    RenderAnnotation, RenderAnnotationKind, RenderKeyframe, RenderKeyframes, RenderMotionPlan,
+    RenderStyleCondition, RenderViewTransitionRule, ViewTransitionName, ViewTransitionPart,
+};
 use crate::source::{SourceId, Span};
 use crate::style::StyleDeclaration;
 
@@ -32,6 +38,7 @@ pub(crate) struct Stylesheet {
     pub(crate) rules: Vec<CssRule>,
     pub(crate) annotations: Vec<RenderAnnotation>,
     pub(crate) imports: Vec<StylesheetImport>,
+    pub(crate) motion: RenderMotionPlan,
 }
 
 impl Stylesheet {
@@ -45,6 +52,7 @@ impl Stylesheet {
             rules,
             annotations,
             imports,
+            motion: RenderMotionPlan::default(),
         }
     }
 }
@@ -260,16 +268,16 @@ pub(crate) fn parse_stylesheet_with_offset(
         }
     };
 
-    let mut rules = Vec::new();
-    let mut imports = Vec::new();
-    collect_rule_list(
-        &stylesheet.rules,
-        &line_index,
-        &[],
-        &mut rules,
-        &mut imports,
-    );
-    Compilation::new(Stylesheet::new(rules, annotations, imports), diagnostics)
+    let mut collector = Collector {
+        line_index: &line_index,
+        rules: Vec::new(),
+        imports: Vec::new(),
+        motion: RenderMotionPlan::default(),
+    };
+    collect_rule_list(&stylesheet.rules, &[], None, &mut collector);
+    let mut collected = Stylesheet::new(collector.rules, annotations, collector.imports);
+    collected.motion = collector.motion;
+    Compilation::new(collected, diagnostics)
 }
 
 fn stylesheet_annotations(
@@ -494,102 +502,399 @@ fn style_text(element: &HtmlElement) -> InlineStylesheet {
     }
 }
 
+/// Rules, imports and motion collected from one stylesheet.
+struct Collector<'a> {
+    line_index: &'a LineIndex<'a>,
+    rules: Vec<CssRule>,
+    imports: Vec<StylesheetImport>,
+    motion: RenderMotionPlan,
+}
+
 fn collect_rule_list(
     rule_list: &CssRuleList<'_>,
-    line_index: &LineIndex<'_>,
     conditions: &[RenderStyleCondition],
-    rules: &mut Vec<CssRule>,
-    imports: &mut Vec<StylesheetImport>,
+    parent: Option<&SelectorList<'static>>,
+    out: &mut Collector<'_>,
 ) {
     for rule in &rule_list.0 {
-        collect_rule(rule, line_index, conditions, rules, imports);
+        collect_rule(rule, conditions, parent, out);
     }
+}
+
+fn nested_conditions(
+    conditions: &[RenderStyleCondition],
+    condition: Option<RenderStyleCondition>,
+) -> Vec<RenderStyleCondition> {
+    let mut nested = conditions.to_vec();
+    nested.extend(condition);
+    nested
 }
 
 fn collect_rule(
     rule: &LightningCssRule<'_>,
-    line_index: &LineIndex<'_>,
     conditions: &[RenderStyleCondition],
-    rules: &mut Vec<CssRule>,
-    imports: &mut Vec<StylesheetImport>,
+    parent: Option<&SelectorList<'static>>,
+    out: &mut Collector<'_>,
 ) {
     match rule {
         LightningCssRule::Import(rule) => {
-            imports.push(StylesheetImport {
+            out.imports.push(StylesheetImport {
                 specifier: rule.url.to_string(),
-                span: line_index.rule_span(rule.loc),
+                span: out.line_index.rule_span(rule.loc),
             });
         }
         LightningCssRule::Style(style_rule) => {
-            lower_style_rule(style_rule, line_index, conditions, rules, imports);
+            lower_style_rule(style_rule, conditions, parent, out);
         }
         LightningCssRule::Media(rule) => {
-            let mut nested = conditions.to_vec();
-            if let Ok(query) = rule.query.to_css_string(PrinterOptions::default()) {
-                nested.push(RenderStyleCondition::Media(query.into()));
-            }
-            collect_rule_list(&rule.rules, line_index, &nested, rules, imports);
+            let condition = rule
+                .query
+                .to_css_string(PrinterOptions::default())
+                .ok()
+                .map(|query| RenderStyleCondition::Media(query.into()));
+            let nested = nested_conditions(conditions, condition);
+            collect_rule_list(&rule.rules, &nested, parent, out);
         }
         LightningCssRule::Supports(rule) => {
-            let mut nested = conditions.to_vec();
-            if let Ok(condition) = rule.condition.to_css_string(PrinterOptions::default()) {
-                nested.push(RenderStyleCondition::Supports(condition.into()));
-            }
-            collect_rule_list(&rule.rules, line_index, &nested, rules, imports);
+            let condition = rule
+                .condition
+                .to_css_string(PrinterOptions::default())
+                .ok()
+                .map(|condition| RenderStyleCondition::Supports(condition.into()));
+            let nested = nested_conditions(conditions, condition);
+            collect_rule_list(&rule.rules, &nested, parent, out);
         }
         LightningCssRule::MozDocument(rule) => {
-            collect_rule_list(&rule.rules, line_index, conditions, rules, imports)
+            collect_rule_list(&rule.rules, conditions, parent, out);
         }
         LightningCssRule::Nesting(rule) => {
-            lower_style_rule(&rule.style, line_index, conditions, rules, imports);
+            lower_style_rule(&rule.style, conditions, parent, out);
+        }
+        LightningCssRule::NestedDeclarations(rule) => {
+            // Declarations after nested rules apply to the parent selector.
+            if let Some(parent) = parent {
+                let span = out.line_index.rule_span(rule.loc);
+                push_style_rule(
+                    parent.clone(),
+                    declarations_from_block(&rule.declarations, span),
+                    conditions,
+                    span,
+                    out,
+                );
+            }
         }
         LightningCssRule::LayerBlock(rule) => {
-            collect_rule_list(&rule.rules, line_index, conditions, rules, imports)
+            collect_rule_list(&rule.rules, conditions, parent, out);
         }
         LightningCssRule::Container(rule) => {
-            let mut nested = conditions.to_vec();
-            if let Some(condition) = container_condition(rule) {
-                nested.push(RenderStyleCondition::Container(condition.into()));
-            }
-            collect_rule_list(&rule.rules, line_index, &nested, rules, imports);
+            let condition = container_condition(rule)
+                .map(|condition| RenderStyleCondition::Container(condition.into()));
+            let nested = nested_conditions(conditions, condition);
+            collect_rule_list(&rule.rules, &nested, parent, out);
         }
         LightningCssRule::Scope(rule) => {
-            collect_rule_list(&rule.rules, line_index, conditions, rules, imports)
+            collect_rule_list(&rule.rules, conditions, parent, out);
         }
         LightningCssRule::StartingStyle(rule) => {
-            collect_rule_list(&rule.rules, line_index, conditions, rules, imports)
+            let nested = nested_conditions(conditions, Some(RenderStyleCondition::StartingStyle));
+            collect_rule_list(&rule.rules, &nested, parent, out);
+        }
+        LightningCssRule::Keyframes(rule) => {
+            if let Some(keyframes) = lower_keyframes(rule, conditions, out.line_index) {
+                out.motion
+                    .keyframes
+                    .retain(|existing| existing.name != keyframes.name);
+                out.motion.keyframes.push(keyframes);
+            }
+        }
+        LightningCssRule::ViewTransition(rule) => {
+            let view_transition = &mut out.motion.view_transition;
+            view_transition.span = out.line_index.rule_span(rule.loc);
+            for property in &rule.properties {
+                match property {
+                    ViewTransitionProperty::Navigation(navigation) => {
+                        view_transition.navigation = matches!(navigation, Navigation::Auto);
+                    }
+                    ViewTransitionProperty::Types(types) => {
+                        view_transition.types = match types {
+                            NoneOrCustomIdentList::None => Vec::new(),
+                            NoneOrCustomIdentList::Idents(idents) => idents
+                                .iter()
+                                .map(|ident| CompactString::from(ident.0.as_ref()))
+                                .collect(),
+                        };
+                    }
+                    ViewTransitionProperty::Custom(_) => {}
+                }
+            }
         }
         _ => {}
     }
 }
 
+fn lower_keyframes(
+    rule: &KeyframesRule<'_>,
+    conditions: &[RenderStyleCondition],
+    line_index: &LineIndex<'_>,
+) -> Option<RenderKeyframes> {
+    let name = match &rule.name {
+        KeyframesName::Ident(ident) => CompactString::from(ident.0.as_ref()),
+        KeyframesName::Custom(name) => CompactString::from(name.as_ref()),
+    };
+    let span = line_index.rule_span(rule.loc);
+    let mut frames = Vec::new();
+    for keyframe in &rule.keyframes {
+        let declarations = declarations_from_block(&keyframe.declarations, span);
+        for selector in &keyframe.selectors {
+            let offset = match selector {
+                KeyframeSelector::From => 0.0,
+                KeyframeSelector::To => 1.0,
+                KeyframeSelector::Percentage(percentage) => percentage.0,
+                // Scroll-driven ranges have no time-based offset.
+                KeyframeSelector::TimelineRangePercentage(_) => continue,
+            };
+            if offset.is_finite() && (0.0..=1.0).contains(&offset) {
+                frames.push(RenderKeyframe {
+                    offset,
+                    declarations: declarations.clone(),
+                });
+            }
+        }
+    }
+    frames.sort_by(|left, right| left.offset.total_cmp(&right.offset));
+    (!frames.is_empty()).then(|| RenderKeyframes {
+        name,
+        frames,
+        conditions: conditions.to_vec(),
+        span,
+    })
+}
+
 fn lower_style_rule(
     style_rule: &StyleRule<'_>,
-    line_index: &LineIndex<'_>,
     conditions: &[RenderStyleCondition],
-    rules: &mut Vec<CssRule>,
-    imports: &mut Vec<StylesheetImport>,
+    parent: Option<&SelectorList<'static>>,
+    out: &mut Collector<'_>,
 ) {
-    let span = line_index.rule_span(style_rule.loc);
+    let span = out.line_index.rule_span(style_rule.loc);
+    let selectors = match parent {
+        Some(parent) => resolve_nesting(&style_rule.selectors, parent),
+        None => Some(style_rule.selectors.clone().into_owned()),
+    };
+    let Some(selectors) = selectors else {
+        return;
+    };
     let declarations = declarations_from_block(&style_rule.declarations, span);
     if !declarations.is_empty() {
-        let raw = style_rule
-            .selectors
-            .to_css_string(PrinterOptions::default())
-            .unwrap_or_else(|_| "<unprintable selector>".to_owned());
-
-        rules.push(CssRule {
-            selector: CssSelector {
-                raw,
-                selectors: style_rule.selectors.clone().into_owned(),
-            },
-            declarations,
-            conditions: conditions.to_vec(),
-            span,
-        });
+        push_style_rule(selectors.clone(), declarations, conditions, span, out);
     }
 
-    collect_rule_list(&style_rule.rules, line_index, conditions, rules, imports);
+    collect_rule_list(&style_rule.rules, conditions, Some(&selectors), out);
+}
+
+/// Record one style rule, routing `::view-transition-*` selectors to the
+/// motion plan and the rest to element rules.
+fn push_style_rule(
+    selectors: SelectorList<'static>,
+    declarations: Vec<StyleDeclaration>,
+    conditions: &[RenderStyleCondition],
+    span: Option<Span>,
+    out: &mut Collector<'_>,
+) {
+    if declarations.is_empty() {
+        return;
+    }
+    let (view_transition, element): (Vec<_>, Vec<_>) = selectors
+        .0
+        .into_iter()
+        .partition(|selector| view_transition_part(selector).is_some());
+    for selector in view_transition {
+        if let Some(rule) = lower_view_transition_rule(
+            &selector,
+            &declarations,
+            conditions,
+            span,
+            out.motion.view_transition.rules.len(),
+        ) {
+            out.motion.view_transition.rules.push(rule);
+        }
+    }
+    if element.is_empty() {
+        return;
+    }
+    let selectors = SelectorList::new(element.into());
+    let raw = selectors
+        .to_css_string(PrinterOptions::default())
+        .unwrap_or_else(|_| "<unprintable selector>".to_owned());
+    out.rules.push(CssRule {
+        selector: CssSelector { raw, selectors },
+        declarations,
+        conditions: conditions.to_vec(),
+        span,
+    });
+}
+
+/// Resolve `&` in nested selectors as `:is(<parent>)`, as CSS Nesting
+/// defines it. A nested selector without `&` is relative to its parent as
+/// a descendant.
+fn resolve_nesting(
+    selectors: &SelectorList<'_>,
+    parent: &SelectorList<'static>,
+) -> Option<SelectorList<'static>> {
+    let parent = parent.to_css_string(PrinterOptions::default()).ok()?;
+    let parent = format!(":is({parent})");
+    let resolved = selectors
+        .0
+        .iter()
+        .filter_map(|selector| selector.to_css_string(PrinterOptions::default()).ok())
+        .map(|selector| {
+            if contains_nesting(&selector) {
+                replace_nesting(&selector, &parent)
+            } else {
+                format!("{parent} {selector}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    parse_selector_list(&resolved)
+}
+
+fn parse_selector_list(selectors: &str) -> Option<SelectorList<'static>> {
+    let source = format!("{selectors} {{}}");
+    let stylesheet = StyleSheet::parse(&source, ParserOptions::default()).ok()?;
+    stylesheet.rules.0.into_iter().find_map(|rule| match rule {
+        LightningCssRule::Style(rule) => Some(rule.selectors.into_owned()),
+        _ => None,
+    })
+}
+
+/// Visit the `&` tokens of a serialized selector, skipping strings and escapes.
+fn nesting_positions(selector: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut quote = None;
+    let mut escaped = false;
+    selector
+        .char_indices()
+        .filter_map(move |(index, character)| {
+            if escaped {
+                escaped = false;
+                return None;
+            }
+            match (quote, character) {
+                (_, '\\') => escaped = true,
+                (Some(open), _) if character == open => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'') => quote = Some(character),
+                (None, '&') => return Some(index),
+                (None, _) => {}
+            }
+            None
+        })
+}
+
+fn contains_nesting(selector: &str) -> bool {
+    nesting_positions(selector).next().is_some()
+}
+
+fn replace_nesting(selector: &str, parent: &str) -> String {
+    let mut resolved = String::with_capacity(selector.len() + parent.len());
+    let mut last = 0;
+    for index in nesting_positions(selector) {
+        resolved.push_str(&selector[last..index]);
+        resolved.push_str(parent);
+        last = index + 1;
+    }
+    resolved.push_str(&selector[last..]);
+    resolved
+}
+
+/// The view-transition pseudo-element a selector targets, with its
+/// serialized argument (`root`, `*`, `card.hero`, …).
+fn view_transition_part(selector: &Selector<'_>) -> Option<(ViewTransitionPart, String)> {
+    let part = selector
+        .iter_raw_match_order()
+        .find_map(|component| match component {
+            Component::PseudoElement(PseudoElement::ViewTransition) => {
+                Some(ViewTransitionPart::Overlay)
+            }
+            Component::PseudoElement(PseudoElement::ViewTransitionGroup { .. }) => {
+                Some(ViewTransitionPart::Group)
+            }
+            Component::PseudoElement(PseudoElement::ViewTransitionImagePair { .. }) => {
+                Some(ViewTransitionPart::ImagePair)
+            }
+            Component::PseudoElement(PseudoElement::ViewTransitionOld { .. }) => {
+                Some(ViewTransitionPart::Old)
+            }
+            Component::PseudoElement(PseudoElement::ViewTransitionNew { .. }) => {
+                Some(ViewTransitionPart::New)
+            }
+            _ => None,
+        })?;
+    // The part selector's fields are private; read its argument back from
+    // the serialized selector, where the pseudo-element is always last.
+    let css = selector.to_css_string(PrinterOptions::default()).ok()?;
+    let pseudo = &css[css.rfind("::view-transition")?..];
+    let argument = pseudo
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or("*")
+        .trim()
+        .to_owned();
+    Some((part, argument))
+}
+
+fn lower_view_transition_rule(
+    selector: &Selector<'_>,
+    declarations: &[StyleDeclaration],
+    conditions: &[RenderStyleCondition],
+    span: Option<Span>,
+    source_order: usize,
+) -> Option<RenderViewTransitionRule> {
+    let (part, argument) = view_transition_part(selector)?;
+    let mut segments = argument.split('.');
+    let name = match segments.next().unwrap_or("*").trim() {
+        "" | "*" => ViewTransitionName::Any,
+        name => ViewTransitionName::Named(name.into()),
+    };
+    let classes = segments
+        .filter(|class| !class.is_empty())
+        .map(CompactString::from)
+        .collect();
+    let mut types = Vec::new();
+    for component in selector.iter_raw_match_order() {
+        if let Component::NonTSPseudoClass(PseudoClass::ActiveViewTransitionType { kind }) =
+            component
+        {
+            types.extend(
+                kind.iter()
+                    .map(|ident| CompactString::from(ident.0.as_ref())),
+            );
+        }
+    }
+    Some(RenderViewTransitionRule {
+        part,
+        name,
+        classes,
+        types,
+        conditions: conditions
+            .iter()
+            .filter(|condition| {
+                matches!(
+                    condition,
+                    RenderStyleCondition::Media(_) | RenderStyleCondition::Supports(_)
+                )
+            })
+            .cloned()
+            .collect(),
+        declarations: declarations.to_vec(),
+        specificity: selector.specificity(),
+        source_order,
+        selector: selector
+            .to_css_string(PrinterOptions::default())
+            .unwrap_or_default()
+            .into(),
+        span,
+    })
 }
 
 fn container_condition(rule: &lightningcss::rules::container::ContainerRule<'_>) -> Option<String> {
@@ -1016,6 +1321,16 @@ fn collect_component_dynamic_conditions(
     conditions: &mut Vec<RenderStyleCondition>,
 ) {
     match component {
+        Component::NonTSPseudoClass(PseudoClass::ActiveViewTransitionType { kind }) => {
+            push_unique_condition(
+                conditions,
+                RenderStyleCondition::ActiveViewTransitionType(
+                    kind.iter()
+                        .map(|ident| CompactString::from(ident.0.as_ref()))
+                        .collect(),
+                ),
+            );
+        }
         Component::NonTSPseudoClass(pseudo_class) => {
             if let Some(name) = dynamic_pseudo_class_name(pseudo_class) {
                 push_unique_condition(

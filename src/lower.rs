@@ -15,12 +15,12 @@ use crate::plan::{
     RenderAnnotation, RenderAnnotationKind, RenderAttribute, RenderChoiceOption, RenderChoiceState,
     RenderControlFlow, RenderControlFlowKind, RenderDensity, RenderDynamicStyleBinding,
     RenderElement, RenderFormControl, RenderFormControlType, RenderFormDataField,
-    RenderHeadElement, RenderNode, RenderPlan, RenderPseudoElement, RenderRaw, RenderRoot,
-    RenderScriptKind, RenderScriptReference, RenderSemanticExtra, RenderSemantics, RenderSize,
-    RenderSourceIntent, RenderSourceLogic, RenderSourceProp, RenderStateBinding, RenderStateKind,
-    RenderStateOwner, RenderStyleCondition, RenderStyleVariant, RenderText, RenderTextInputState,
-    RenderThemePlan, RenderToggleState, RenderTone, RenderValidation, RenderValidationConstraint,
-    RenderVariant, SlotId, UiRole,
+    RenderHeadElement, RenderMotionPlan, RenderNode, RenderPlan, RenderPseudoElement, RenderRaw,
+    RenderRoot, RenderScriptKind, RenderScriptReference, RenderSemanticExtra, RenderSemantics,
+    RenderSize, RenderSourceIntent, RenderSourceLogic, RenderSourceProp, RenderStateBinding,
+    RenderStateKind, RenderStateOwner, RenderStyleCondition, RenderStyleVariant, RenderText,
+    RenderTextInputState, RenderThemePlan, RenderToggleState, RenderTone, RenderValidation,
+    RenderValidationConstraint, RenderVariant, SlotId, UiRole,
 };
 use crate::script::{ActionIndex, ScriptStyleDeclaration, ScriptStyleIndex, analyze_event_handler};
 use crate::source::{SourceId, SourceKind, SourceMap, Span};
@@ -114,6 +114,9 @@ pub(crate) fn lower_document_with_context(
         .map_or_else(RenderThemePlan::default, StyleIndex::theme_plan);
     theme.collect_from_root(&root);
     theme.collect_from_nodes(&nodes);
+    let motion = context
+        .styles
+        .map_or_else(RenderMotionPlan::default, StyleIndex::motion_plan);
 
     Compilation::new(
         RenderPlan::new(nodes)
@@ -122,7 +125,8 @@ pub(crate) fn lower_document_with_context(
             .with_annotations(annotations)
             .with_scripts(runtime.scripts)
             .with_source_logic(runtime.source_logic)
-            .with_theme(theme),
+            .with_theme(theme)
+            .with_motion(motion),
         runtime.diagnostics,
     )
 }

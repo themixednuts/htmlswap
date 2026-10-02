@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use compact_str::CompactString;
 
 use crate::plan::{
-    RenderStyleCondition, RenderStyleVariant, RenderStylesheetRule, RenderThemePlan,
-    RenderThemeScope,
+    RenderMotionPlan, RenderStyleCondition, RenderStyleVariant, RenderStylesheetRule,
+    RenderThemePlan, RenderThemeScope,
 };
 use crate::style::{StyleDeclaration, StyleProperty, StyleValue};
 
@@ -14,6 +14,7 @@ use super::{CssRule, StyleElement, Stylesheet};
 pub(crate) struct StyleIndex {
     rules: Vec<CssRule>,
     theme: RenderThemePlan,
+    motion: RenderMotionPlan,
 }
 
 impl StyleIndex {
@@ -27,6 +28,7 @@ impl StyleIndex {
             self.collect_theme_rule(rule);
         }
         self.rules.extend(stylesheet.rules);
+        self.motion.extend(stylesheet.motion);
     }
 
     #[must_use]
@@ -105,7 +107,12 @@ impl StyleIndex {
 
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.rules.is_empty()
+        self.rules.is_empty() && self.motion.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn motion_plan(&self) -> RenderMotionPlan {
+        self.motion.clone()
     }
 
     #[must_use]
@@ -283,6 +290,8 @@ enum ConditionPart {
     Media(CompactString),
     Supports(CompactString),
     Container(CompactString),
+    StartingStyle,
+    ActiveViewTransitionType(Vec<CompactString>),
 }
 
 impl From<&RenderStyleCondition> for ConditionPart {
@@ -293,6 +302,10 @@ impl From<&RenderStyleCondition> for ConditionPart {
             RenderStyleCondition::Media(value) => Self::Media(value.clone()),
             RenderStyleCondition::Supports(value) => Self::Supports(value.clone()),
             RenderStyleCondition::Container(value) => Self::Container(value.clone()),
+            RenderStyleCondition::StartingStyle => Self::StartingStyle,
+            RenderStyleCondition::ActiveViewTransitionType(types) => {
+                Self::ActiveViewTransitionType(types.clone())
+            }
         }
     }
 }

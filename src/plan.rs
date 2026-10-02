@@ -217,6 +217,8 @@ pub struct RenderPlan {
     pub scripts: Vec<RenderScriptReference>,
     pub source_logic: Vec<RenderSourceLogic>,
     pub theme: RenderThemePlan,
+    /// `@keyframes` and view transitions.
+    pub motion: RenderMotionPlan,
 }
 
 impl RenderPlan {
@@ -232,7 +234,14 @@ impl RenderPlan {
             scripts: Vec::new(),
             source_logic: Vec::new(),
             theme: RenderThemePlan::default(),
+            motion: RenderMotionPlan::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_motion(mut self, motion: RenderMotionPlan) -> Self {
+        self.motion = motion;
+        self
     }
 
     #[must_use]
@@ -300,6 +309,249 @@ impl RenderRoot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderHeadElement {
     pub html: String,
+    pub span: Option<Span>,
+}
+
+// Keyframe offsets are finite by construction, so equality is total.
+impl Eq for RenderMotionPlan {}
+impl Eq for RenderKeyframes {}
+impl Eq for RenderKeyframe {}
+
+/// Motion defined by stylesheets: `@keyframes` and view transitions.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RenderMotionPlan {
+    /// `@keyframes` rules by name; a later rule replaces an earlier one.
+    pub keyframes: Vec<RenderKeyframes>,
+    /// `@view-transition` and the `::view-transition-*` rules.
+    pub view_transition: RenderViewTransitionPlan,
+}
+
+impl RenderMotionPlan {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keyframes.is_empty() && self.view_transition.is_empty()
+    }
+
+    /// The `@keyframes` rule with this name.
+    #[must_use]
+    pub fn keyframes(&self, name: &str) -> Option<&RenderKeyframes> {
+        self.keyframes
+            .iter()
+            .rev()
+            .find(|keyframes| keyframes.name == name)
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        for keyframes in other.keyframes {
+            self.keyframes
+                .retain(|existing| existing.name != keyframes.name);
+            self.keyframes.push(keyframes);
+        }
+        self.view_transition.extend(other.view_transition);
+    }
+}
+
+/// One `@keyframes` rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderKeyframes {
+    pub name: CompactString,
+    /// Keyframes sorted by offset. A selector list such as `0%, 100%` yields
+    /// one keyframe per offset.
+    pub frames: Vec<RenderKeyframe>,
+    /// Media and supports conditions the rule was nested in.
+    pub conditions: Vec<RenderStyleCondition>,
+    pub span: Option<Span>,
+}
+
+/// One keyframe of a `@keyframes` rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenderKeyframe {
+    /// Offset in `0..=1`.
+    pub offset: f32,
+    pub declarations: Vec<StyleDeclaration>,
+}
+
+/// Where an animated property sits between two keyframes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyframeInterval<'a> {
+    /// The value at the start of the interval, or `None` for the element's
+    /// own value (no keyframe sets the property at or before this point).
+    pub from: Option<&'a StyleDeclaration>,
+    /// The value at the end of the interval, or `None` for the element's own value.
+    pub to: Option<&'a StyleDeclaration>,
+    /// Progress through the interval in `0..=1`, before easing.
+    pub progress: f32,
+    /// The keyframe that starts the interval, whose `animation-timing-function`
+    /// (if any) eases it.
+    pub start: Option<&'a RenderKeyframe>,
+}
+
+impl RenderKeyframes {
+    /// Locate `property` (a CSS name) at `progress` in `0..=1`, following the
+    /// CSS rule that keyframes which do not set a property are skipped for it.
+    #[must_use]
+    pub fn interval(&self, property: &str, progress: f32) -> Option<KeyframeInterval<'_>> {
+        let sets = |frame: &&RenderKeyframe| {
+            frame
+                .declarations
+                .iter()
+                .any(|declaration| declaration.property.as_str() == property)
+        };
+        if !self.frames.iter().any(|frame| sets(&frame)) {
+            return None;
+        }
+        fn value<'a>(frame: &'a RenderKeyframe, property: &str) -> Option<&'a StyleDeclaration> {
+            frame
+                .declarations
+                .iter()
+                .rev()
+                .find(|declaration| declaration.property.as_str() == property)
+        }
+        let before = self
+            .frames
+            .iter()
+            .rev()
+            .find(|frame| sets(frame) && frame.offset <= progress);
+        let after = self
+            .frames
+            .iter()
+            .filter(sets)
+            .find(|frame| frame.offset > progress);
+        let start_offset = before.map_or(0.0, |frame| frame.offset);
+        let end_offset = after.map_or(1.0, |frame| frame.offset);
+        let span = end_offset - start_offset;
+        Some(KeyframeInterval {
+            from: before.and_then(|frame| value(frame, property)),
+            to: after.and_then(|frame| value(frame, property)),
+            progress: if span > 0.0 {
+                ((progress - start_offset) / span).clamp(0.0, 1.0)
+            } else {
+                1.0
+            },
+            start: before,
+        })
+    }
+}
+
+/// `@view-transition` and the rules that style view-transition pseudo-elements.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderViewTransitionPlan {
+    /// `navigation: auto` opts document replacements into a view transition.
+    pub navigation: bool,
+    /// `types` named by `@view-transition`.
+    pub types: Vec<CompactString>,
+    /// `::view-transition-*` rules in source order.
+    pub rules: Vec<RenderViewTransitionRule>,
+    pub span: Option<Span>,
+}
+
+impl RenderViewTransitionPlan {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.navigation && self.types.is_empty() && self.rules.is_empty()
+    }
+
+    pub(crate) fn extend(&mut self, other: Self) {
+        if other.span.is_some() {
+            self.navigation = other.navigation;
+            self.types = other.types;
+            self.span = other.span;
+        }
+        let offset = self.rules.len();
+        self.rules.extend(other.rules.into_iter().map(|mut rule| {
+            rule.source_order += offset;
+            rule
+        }));
+    }
+
+    /// Declarations that apply to one pseudo-element of a transition, in
+    /// cascade order (lowest priority first). `name` is the captured
+    /// element's `view-transition-name` (`root` for the document), `classes`
+    /// its `view-transition-class` list, `active_types` the transition's
+    /// types, and `condition_matches` evaluates media and supports conditions.
+    #[must_use]
+    pub fn declarations_for<'a>(
+        &'a self,
+        part: ViewTransitionPart,
+        name: &str,
+        classes: &[CompactString],
+        active_types: &[CompactString],
+        condition_matches: impl Fn(&RenderStyleCondition) -> bool,
+    ) -> Vec<&'a StyleDeclaration> {
+        let mut matched: Vec<&RenderViewTransitionRule> = self
+            .rules
+            .iter()
+            .filter(|rule| rule.part == part)
+            .filter(|rule| rule.name.matches(name))
+            .filter(|rule| rule.classes.iter().all(|class| classes.contains(class)))
+            .filter(|rule| {
+                rule.types.is_empty() || rule.types.iter().any(|kind| active_types.contains(kind))
+            })
+            .filter(|rule| rule.conditions.iter().all(&condition_matches))
+            .collect();
+        matched.sort_by_key(|rule| (rule.specificity, rule.source_order));
+        let normal = matched
+            .iter()
+            .flat_map(|rule| rule.declarations.iter())
+            .filter(|declaration| !declaration.important);
+        let important = matched
+            .iter()
+            .flat_map(|rule| rule.declarations.iter())
+            .filter(|declaration| declaration.important);
+        normal.chain(important).collect()
+    }
+}
+
+/// A view-transition pseudo-element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ViewTransitionPart {
+    /// `::view-transition`, the overlay root.
+    Overlay,
+    /// `::view-transition-group(name)`, which animates position and size.
+    Group,
+    /// `::view-transition-image-pair(name)`.
+    ImagePair,
+    /// `::view-transition-old(name)`, the outgoing capture.
+    Old,
+    /// `::view-transition-new(name)`, the incoming capture.
+    New,
+}
+
+/// The name argument of a view-transition pseudo-element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewTransitionName {
+    /// `*`, or no name (classes only).
+    Any,
+    /// A `view-transition-name`; `root` names the document.
+    Named(CompactString),
+}
+
+impl ViewTransitionName {
+    #[must_use]
+    pub fn matches(&self, name: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Named(named) => named == name,
+        }
+    }
+}
+
+/// One `::view-transition-*` rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderViewTransitionRule {
+    pub part: ViewTransitionPart,
+    pub name: ViewTransitionName,
+    /// `view-transition-class` names the captured element must all have.
+    pub classes: Vec<CompactString>,
+    /// `:active-view-transition-type(...)` on the originating element; the
+    /// rule applies when the transition has any of them. Empty applies always.
+    pub types: Vec<CompactString>,
+    /// Media and supports conditions.
+    pub conditions: Vec<RenderStyleCondition>,
+    pub declarations: Vec<StyleDeclaration>,
+    pub specificity: u32,
+    pub source_order: usize,
+    pub selector: CompactString,
     pub span: Option<Span>,
 }
 
@@ -1486,6 +1738,12 @@ pub enum RenderStyleCondition {
     Media(CompactString),
     Supports(CompactString),
     Container(CompactString),
+    /// Inside `@starting-style`: the values an element starts from the first
+    /// time it is styled, so transitions can animate its entry.
+    StartingStyle,
+    /// `:active-view-transition-type(...)`: matches while a view transition
+    /// with any of these types is active.
+    ActiveViewTransitionType(Vec<CompactString>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

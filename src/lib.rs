@@ -19,6 +19,7 @@ pub mod layout_debug;
 mod lower;
 mod material_symbols;
 pub mod module_graph;
+pub mod motion;
 pub mod parse;
 pub mod plan;
 pub mod resource;
@@ -83,22 +84,25 @@ pub use module_graph::{
 };
 pub use parse::{parse_document, parse_fragment};
 pub use plan::{
-    ActionBinding, ActionPayload, ComponentId, RegionId, RenderAccessibility, RenderActionArgument,
-    RenderActionEffect, RenderActionHandler, RenderActionHandlerEffect, RenderActionInvocation,
-    RenderActionPlan, RenderAnnotation, RenderAnnotationKind, RenderAttribute, RenderChoiceOption,
-    RenderChoiceState, RenderControlFlow, RenderControlFlowHost, RenderControlFlowKind,
-    RenderDensity, RenderDynamicStyleBinding, RenderElement, RenderFormBinding, RenderFormControl,
-    RenderFormControlBinding, RenderFormControlType, RenderFormDataField, RenderFormSubmit,
-    RenderHeadElement, RenderLoopLocal, RenderNode, RenderPlan, RenderPseudoElement, RenderRaw,
-    RenderRoot, RenderScriptKind, RenderScriptReference, RenderSemanticExtra, RenderSemantics,
-    RenderSize, RenderSourceCallback, RenderSourceComponentLogic, RenderSourceDerived,
-    RenderSourceEffect, RenderSourceIntent, RenderSourceLocal, RenderSourceLogic,
-    RenderSourceLogicItem, RenderSourceMount, RenderSourceProp, RenderSourceRef,
-    RenderSourceSnippet, RenderSourceState, RenderStateBinding, RenderStateKind, RenderStateOwner,
-    RenderStatePlan, RenderStateValueSource, RenderStyleCondition, RenderStyleVariant, RenderText,
-    RenderTextInputState, RenderThemePlan, RenderThemeScope, RenderThemeToken,
-    RenderThemeTokenValue, RenderToggleState, RenderTone, RenderValidation,
-    RenderValidationConstraint, RenderVariant, SlotId, ThemeTokenKind, UiRole,
+    ActionBinding, ActionPayload, ComponentId, KeyframeInterval, RegionId, RenderAccessibility,
+    RenderActionArgument, RenderActionEffect, RenderActionHandler, RenderActionHandlerEffect,
+    RenderActionInvocation, RenderActionPlan, RenderAnnotation, RenderAnnotationKind,
+    RenderAttribute, RenderChoiceOption, RenderChoiceState, RenderControlFlow,
+    RenderControlFlowHost, RenderControlFlowKind, RenderDensity, RenderDynamicStyleBinding,
+    RenderElement, RenderFormBinding, RenderFormControl, RenderFormControlBinding,
+    RenderFormControlType, RenderFormDataField, RenderFormSubmit, RenderHeadElement,
+    RenderKeyframe, RenderKeyframes, RenderLoopLocal, RenderMotionPlan, RenderNode, RenderPlan,
+    RenderPseudoElement, RenderRaw, RenderRoot, RenderScriptKind, RenderScriptReference,
+    RenderSemanticExtra, RenderSemantics, RenderSize, RenderSourceCallback,
+    RenderSourceComponentLogic, RenderSourceDerived, RenderSourceEffect, RenderSourceIntent,
+    RenderSourceLocal, RenderSourceLogic, RenderSourceLogicItem, RenderSourceMount,
+    RenderSourceProp, RenderSourceRef, RenderSourceSnippet, RenderSourceState, RenderStateBinding,
+    RenderStateKind, RenderStateOwner, RenderStatePlan, RenderStateValueSource,
+    RenderStyleCondition, RenderStyleVariant, RenderText, RenderTextInputState, RenderThemePlan,
+    RenderThemeScope, RenderThemeToken, RenderThemeTokenValue, RenderToggleState, RenderTone,
+    RenderValidation, RenderValidationConstraint, RenderVariant, RenderViewTransitionPlan,
+    RenderViewTransitionRule, SlotId, ThemeTokenKind, UiRole, ViewTransitionName,
+    ViewTransitionPart,
 };
 pub use resource::{
     DefaultResourceResolver, FileSystemResourceResolver, FileSystemResourceResolverOptions,

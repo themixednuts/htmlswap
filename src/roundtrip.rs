@@ -840,6 +840,10 @@ fn style_conditions_signature(conditions: &[RenderStyleCondition]) -> String {
             RenderStyleCondition::Media(value) => format!("media:{value}"),
             RenderStyleCondition::Supports(value) => format!("supports:{value}"),
             RenderStyleCondition::Container(value) => format!("container:{value}"),
+            RenderStyleCondition::StartingStyle => "starting-style".to_owned(),
+            RenderStyleCondition::ActiveViewTransitionType(types) => {
+                format!("active-view-transition-type:{}", types.join(","))
+            }
         })
         .collect::<Vec<_>>()
         .join("|")

@@ -5898,7 +5898,9 @@ fn dynamic_style_method_name(conditions: &[RenderStyleCondition]) -> Option<&'st
             RenderStyleCondition::Media(query) => !interaction_media_allows(query, value),
             RenderStyleCondition::PseudoElement(_)
             | RenderStyleCondition::Supports(_)
-            | RenderStyleCondition::Container(_) => true,
+            | RenderStyleCondition::Container(_)
+            | RenderStyleCondition::StartingStyle
+            | RenderStyleCondition::ActiveViewTransitionType(_) => true,
         })
     {
         return None;
@@ -7580,6 +7582,10 @@ fn format_pseudo_conditions_metadata(conditions: &[RenderStyleCondition]) -> Str
             RenderStyleCondition::Media(value) => format!("media={:?}", value.as_str()),
             RenderStyleCondition::Supports(value) => format!("supports={:?}", value.as_str()),
             RenderStyleCondition::Container(value) => format!("container={:?}", value.as_str()),
+            RenderStyleCondition::StartingStyle => "starting-style".to_owned(),
+            RenderStyleCondition::ActiveViewTransitionType(types) => {
+                format!("active-view-transition-type={:?}", types.join(","))
+            }
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -7600,6 +7606,10 @@ fn format_style_condition(condition: &RenderStyleCondition) -> String {
         RenderStyleCondition::Media(value) => format!("@media {value}"),
         RenderStyleCondition::Supports(value) => format!("@supports {value}"),
         RenderStyleCondition::Container(value) => format!("@container {value}"),
+        RenderStyleCondition::StartingStyle => "@starting-style".to_owned(),
+        RenderStyleCondition::ActiveViewTransitionType(types) => {
+            format!(":active-view-transition-type({})", types.join(", "))
+        }
     }
 }
 

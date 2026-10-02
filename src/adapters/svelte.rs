@@ -2728,6 +2728,14 @@ fn conditioned_style_rule(
             RenderStyleCondition::Media(value) => wrappers.push(format!("@media {value}")),
             RenderStyleCondition::Supports(value) => wrappers.push(format!("@supports {value}")),
             RenderStyleCondition::Container(value) => wrappers.push(format!("@container {value}")),
+            RenderStyleCondition::StartingStyle => wrappers.push("@starting-style".to_owned()),
+            RenderStyleCondition::ActiveViewTransitionType(types) => {
+                selector = format!(
+                    ":global(:root:active-view-transition-type({})) {}",
+                    types.join(", "),
+                    selector.trim_start()
+                );
+            }
         }
     }
     let mut rule = String::new();

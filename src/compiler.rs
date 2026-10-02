@@ -1783,6 +1783,25 @@ fn rebase_stylesheet(mut stylesheet: Stylesheet, source_id: SourceId) -> Stylesh
     for import in &mut stylesheet.imports {
         import.span = import.span.map(|span| span.with_source(source_id));
     }
+    let rebase = |span: &mut Option<crate::source::Span>| {
+        *span = span.map(|span| span.with_source(source_id))
+    };
+    for keyframes in &mut stylesheet.motion.keyframes {
+        rebase(&mut keyframes.span);
+        for frame in &mut keyframes.frames {
+            for declaration in &mut frame.declarations {
+                rebase(&mut declaration.span);
+            }
+        }
+    }
+    let view_transition = &mut stylesheet.motion.view_transition;
+    rebase(&mut view_transition.span);
+    for rule in &mut view_transition.rules {
+        rebase(&mut rule.span);
+        for declaration in &mut rule.declarations {
+            rebase(&mut declaration.span);
+        }
+    }
     stylesheet
 }
 
