@@ -443,7 +443,6 @@ dependencies = [
  "arcstr",
  "clap",
  "compact_str",
- "cssparser",
  "heck",
  "html5ever",
  "include_dir",

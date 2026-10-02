@@ -7,7 +7,6 @@ pub mod assets;
 pub mod bundle;
 pub mod class;
 pub mod compiler;
-pub mod computed;
 mod css;
 pub mod dc_bundle;
 pub mod diagnostics;
