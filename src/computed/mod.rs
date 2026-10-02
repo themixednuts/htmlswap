@@ -23,6 +23,19 @@ use lightningcss::values::color::{CssColor, RGBA};
 
 use crate::style::{StyleDeclaration, StyleProperty};
 
+mod media;
+mod style;
+mod values;
+
+pub use media::MediaEnvironment;
+pub use style::{
+    Align, BorderStyle, BoxShadow, BoxSizing, ComputedStyle, Corners, Cursor, DecorationThickness,
+    Display, Distribute, FlexDirection, FlexWrap, FontFamily, FontStyle, GridAutoFlow, GridLine,
+    LineHeight, Overflow, Position, RepeatCount, Sides, Size, StyleContext, TextAlign,
+    TextOverflow, TextWrap, Track, TrackBreadth, TrackSize, Unsupported, Visibility, WhiteSpace,
+};
+pub use values::{LengthAuto, LengthPercentage, ValueContext};
+
 /// A color scheme, as used by `color-scheme`, `light-dark()`, system colors
 /// and `prefers-color-scheme`.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -91,7 +104,7 @@ pub fn parse_color(value: &str, context: &ColorContext) -> Option<Rgba> {
     css_color(&color, context)
 }
 
-fn css_color(color: &CssColor, context: &ColorContext) -> Option<Rgba> {
+pub(crate) fn css_color(color: &CssColor, context: &ColorContext) -> Option<Rgba> {
     match color {
         CssColor::CurrentColor => Some(context.current_color),
         CssColor::LightDark(light, dark) => css_color(
@@ -575,7 +588,7 @@ fn color_valued(property: &StyleProperty) -> bool {
 }
 
 /// The inherited computed state an element's declarations resolve against.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ComputedScope {
     custom: CustomProperties,
     /// The computed `color-scheme` value, inherited.
@@ -583,15 +596,74 @@ pub struct ComputedScope {
     preferred: ColorScheme,
     scheme: ColorScheme,
     color: Option<Rgba>,
+    font_size: f32,
+    root_font_size: f32,
+    viewport: (f32, f32),
+    text_transform: TextTransform,
+    font_features: FontFeatures,
+}
+
+impl Default for ComputedScope {
+    fn default() -> Self {
+        Self::root(&MediaEnvironment::default())
+    }
 }
 
 impl ComputedScope {
-    /// The scope above the document root, for a user preferring `preferred`.
+    /// The scope above the document root, in an environment.
     #[must_use]
-    pub fn root(preferred: ColorScheme) -> Self {
+    pub fn root(environment: &MediaEnvironment) -> Self {
         Self {
-            preferred,
-            ..Self::default()
+            custom: CustomProperties::default(),
+            color_scheme: None,
+            preferred: environment.color_scheme,
+            scheme: ColorScheme::Light,
+            color: None,
+            font_size: 16.0,
+            root_font_size: 16.0,
+            viewport: (environment.width, environment.height),
+            text_transform: TextTransform::None,
+            font_features: FontFeatures::default(),
+        }
+    }
+
+    /// The computed `font-size` in pixels.
+    #[must_use]
+    pub const fn font_size(&self) -> f32 {
+        self.font_size
+    }
+
+    /// The inherited `text-transform`.
+    #[must_use]
+    pub const fn text_transform(&self) -> TextTransform {
+        self.text_transform
+    }
+
+    /// The inherited OpenType font features.
+    #[must_use]
+    pub const fn font_features(&self) -> &FontFeatures {
+        &self.font_features
+    }
+
+    /// What relative units resolve against for this element.
+    #[must_use]
+    pub const fn values(&self) -> ValueContext {
+        ValueContext {
+            font_size: self.font_size,
+            root_font_size: self.root_font_size,
+            viewport_width: self.viewport.0,
+            viewport_height: self.viewport.1,
+        }
+    }
+
+    /// The context for computing this element's styles; `parent` is the
+    /// scope it was derived from.
+    #[must_use]
+    pub fn style_context(&self, parent: &Self) -> StyleContext {
+        StyleContext {
+            values: self.values(),
+            parent_font_size: parent.font_size,
+            colors: self.color_context(),
         }
     }
 
@@ -635,7 +707,26 @@ impl ComputedScope {
         self.custom.fingerprint.hash(&mut hasher);
         self.scheme.hash(&mut hasher);
         self.color.hash(&mut hasher);
+        self.font_size.to_bits().hash(&mut hasher);
+        self.root_font_size.to_bits().hash(&mut hasher);
+        self.viewport.0.to_bits().hash(&mut hasher);
+        self.viewport.1.to_bits().hash(&mut hasher);
+        self.text_transform.hash(&mut hasher);
+        self.font_features.hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// The scope of the document root (`html`, `:root`), whose font size
+    /// `rem` refers to.
+    #[must_use]
+    pub fn document_root<'a, I>(&self, declarations: I) -> Self
+    where
+        I: IntoIterator<Item = &'a StyleDeclaration>,
+        I::IntoIter: Clone,
+    {
+        let mut scope = self.child(declarations);
+        scope.root_font_size = scope.font_size;
+        scope
     }
 
     /// The scope of a child element, given its declarations in cascade
@@ -654,6 +745,11 @@ impl ComputedScope {
             preferred: self.preferred,
             scheme: self.scheme,
             color: self.color,
+            font_size: self.font_size,
+            root_font_size: self.root_font_size,
+            viewport: self.viewport,
+            text_transform: self.text_transform,
+            font_features: FontFeatures::default(),
         };
         let last = |name: &str| {
             declarations
@@ -675,6 +771,47 @@ impl ComputedScope {
             .map_or(ColorScheme::Light, |value| {
                 used_color_scheme(value, scope.preferred)
             });
+        // `font-size`, or the `font` shorthand, whichever comes last.
+        let font = declarations
+            .clone()
+            .filter(|declaration| matches!(declaration.property.as_str(), "font-size" | "font"))
+            .enumerate()
+            .max_by_key(|(index, declaration)| (declaration.important, *index))
+            .map(|(_, declaration)| declaration);
+        if let Some(declaration) = font
+            && let Some(value) = scope.substitute(declaration.value.as_str())
+            && let Some(size) = style::font_size_of(
+                declaration.property.as_str(),
+                &value,
+                self.font_size,
+                &self.values(),
+            )
+        {
+            scope.font_size = size;
+        }
+        if let Some(declaration) = last("text-transform")
+            && let Some(value) = scope.substitute(declaration.value.as_str())
+            && let Some(transform) = TextTransform::parse(&value)
+        {
+            scope.text_transform = transform;
+        }
+        if declarations.clone().any(|declaration| {
+            matches!(
+                declaration.property.as_str(),
+                "font-variant"
+                    | "font-variant-numeric"
+                    | "font-variant-ligatures"
+                    | "font-variant-caps"
+                    | "font-variant-position"
+                    | "font-variant-east-asian"
+                    | "font-kerning"
+                    | "font-feature-settings"
+            )
+        }) {
+            scope.font_features = self.font_features.cascade(declarations.clone());
+        } else {
+            scope.font_features = self.font_features.clone();
+        }
         if let Some(declaration) = last("color") {
             // `currentColor` in `color` is the inherited color.
             let inherited = ColorContext {
@@ -795,118 +932,6 @@ pub enum DecorationStyle {
     Dotted,
     Dashed,
     Wavy,
-}
-
-/// The parts of `text-decoration` or its longhands that a value sets.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TextDecoration {
-    pub lines: Option<DecorationLines>,
-    pub style: Option<DecorationStyle>,
-    /// A color, still to be parsed.
-    pub color: Option<CompactString>,
-    /// A thickness: `auto`, `from-font`, or a length.
-    pub thickness: Option<CompactString>,
-}
-
-impl TextDecoration {
-    /// Parse the `text-decoration` shorthand.
-    #[must_use]
-    pub fn parse_shorthand(value: &str) -> Option<Self> {
-        let mut decoration = Self {
-            lines: Some(DecorationLines::default()),
-            style: Some(DecorationStyle::Solid),
-            ..Self::default()
-        };
-        let mut color = Vec::new();
-        for word in split_whitespace_top_level(value) {
-            let lower = word.to_ascii_lowercase();
-            if let Some(lines) = decoration.lines.as_mut()
-                && apply_line_keyword(lines, &lower)
-            {
-                continue;
-            }
-            if let Some(style) = decoration_style(&lower) {
-                decoration.style = Some(style);
-            } else if lower == "auto"
-                || lower == "from-font"
-                || lower.starts_with(|c: char| c.is_ascii_digit() || c == '.')
-            {
-                decoration.thickness = Some(word.into());
-            } else {
-                color.push(word);
-            }
-        }
-        if !color.is_empty() {
-            decoration.color = Some(color.join(" ").into());
-        }
-        Some(decoration)
-    }
-
-    /// Parse `text-decoration-line`.
-    #[must_use]
-    pub fn parse_lines(value: &str) -> Option<DecorationLines> {
-        let mut lines = DecorationLines::default();
-        for word in value.split_whitespace() {
-            if !apply_line_keyword(&mut lines, &word.to_ascii_lowercase()) {
-                return None;
-            }
-        }
-        Some(lines)
-    }
-
-    /// Parse `text-decoration-style`.
-    #[must_use]
-    pub fn parse_style(value: &str) -> Option<DecorationStyle> {
-        decoration_style(&value.trim().to_ascii_lowercase())
-    }
-}
-
-fn apply_line_keyword(lines: &mut DecorationLines, keyword: &str) -> bool {
-    match keyword {
-        "none" => *lines = DecorationLines::default(),
-        "underline" => lines.underline = true,
-        "overline" => lines.overline = true,
-        "line-through" => lines.line_through = true,
-        // Not rendered, as in browsers.
-        "blink" => {}
-        _ => return false,
-    }
-    true
-}
-
-fn decoration_style(keyword: &str) -> Option<DecorationStyle> {
-    Some(match keyword {
-        "solid" => DecorationStyle::Solid,
-        "double" => DecorationStyle::Double,
-        "dotted" => DecorationStyle::Dotted,
-        "dashed" => DecorationStyle::Dashed,
-        "wavy" => DecorationStyle::Wavy,
-        _ => return None,
-    })
-}
-
-fn split_whitespace_top_level(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0_usize;
-    let mut start = None;
-    for (index, character) in value.char_indices() {
-        match character {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            c if c.is_whitespace() && depth == 0 => {
-                if let Some(from) = start.take() {
-                    parts.push(&value[from..index]);
-                }
-                continue;
-            }
-            _ => {}
-        }
-        start.get_or_insert(index);
-    }
-    if let Some(from) = start {
-        parts.push(&value[from..]);
-    }
-    parts
 }
 
 /// OpenType features selected by the inherited `font-variant-*`,
@@ -1117,10 +1142,17 @@ fn feature_settings(value: &str) -> Option<Vec<(CompactString, u32)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorContext, ColorScheme, ComputedScope, CustomProperties, DecorationStyle, FontFeatures,
-        Rgba, TextDecoration, TextTransform, parse_color, used_color_scheme,
+        ColorContext, ColorScheme, ComputedScope, CustomProperties, FontFeatures, Rgba,
+        TextTransform, parse_color, used_color_scheme,
     };
     use crate::style::StyleDeclaration;
+
+    fn dark_environment() -> super::MediaEnvironment {
+        super::MediaEnvironment {
+            color_scheme: ColorScheme::Dark,
+            ..super::MediaEnvironment::default()
+        }
+    }
 
     fn declarations(pairs: &[(&str, &str)]) -> Vec<StyleDeclaration> {
         pairs
@@ -1233,7 +1265,7 @@ mod tests {
 
     #[test]
     fn scopes_resolve_declarations() {
-        let root = ComputedScope::root(ColorScheme::Dark).child(&declarations(&[
+        let root = ComputedScope::root(&dark_environment()).child(&declarations(&[
             ("--accent", "light-dark(#000, #fff)"),
             ("color-scheme", "light dark"),
             ("color", "rgb(0 128 0)"),
@@ -1265,7 +1297,7 @@ mod tests {
             root.resolve(&plain),
             Some(std::borrow::Cow::Borrowed(_))
         ));
-        let light = ComputedScope::root(ColorScheme::Dark);
+        let light = ComputedScope::root(&dark_environment());
         assert_eq!(
             light.scheme(),
             ColorScheme::Light,
@@ -1275,12 +1307,6 @@ mod tests {
 
     #[test]
     fn text_values_parse() {
-        let decoration =
-            TextDecoration::parse_shorthand("underline wavy rgb(1 2 3) 2px").unwrap_or_default();
-        assert!(decoration.lines.is_some_and(|lines| lines.underline));
-        assert_eq!(decoration.style, Some(DecorationStyle::Wavy));
-        assert_eq!(decoration.color.as_deref(), Some("rgb(1 2 3)"));
-        assert_eq!(decoration.thickness.as_deref(), Some("2px"));
         assert_eq!(
             TextTransform::Capitalize.apply("hello big-world"),
             "Hello Big-World"
