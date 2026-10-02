@@ -189,19 +189,49 @@ impl TransitionProperty {
 }
 
 fn shorthand_covers(shorthand: &str, longhand: &str) -> bool {
+    const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+    const CORNERS: [&str; 4] = ["top-left", "top-right", "bottom-right", "bottom-left"];
+    let side = |prefix: &str, suffix: &str| {
+        SIDES.iter().any(|side| {
+            longhand
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                == Some(side)
+        })
+    };
     match shorthand {
         "background" => longhand == "background-color",
-        "border" => matches!(
+        "border" => {
+            side("border-", "-color") || side("border-", "-width") || side("border-", "-style")
+        }
+        "border-color" => side("border-", "-color"),
+        "border-width" => side("border-", "-width"),
+        "border-style" => side("border-", "-style"),
+        "border-top" | "border-right" | "border-bottom" | "border-left" => longhand
+            .strip_prefix(shorthand)
+            .is_some_and(|rest| matches!(rest, "-color" | "-width" | "-style")),
+        "border-radius" => CORNERS.iter().any(|corner| {
+            longhand
+                .strip_prefix("border-")
+                .and_then(|rest| rest.strip_suffix("-radius"))
+                == Some(corner)
+        }),
+        "inset" => SIDES.contains(&longhand),
+        "margin" => side("margin-", ""),
+        "padding" => side("padding-", ""),
+        "gap" => matches!(longhand, "row-gap" | "column-gap"),
+        "flex" => matches!(longhand, "flex-grow" | "flex-shrink" | "flex-basis"),
+        "font" => matches!(
             longhand,
-            "border-color"
-                | "border-width"
-                | "border-top-color"
-                | "border-right-color"
-                | "border-bottom-color"
-                | "border-left-color"
+            "font-size" | "font-weight" | "font-style" | "line-height" | "font-family"
         ),
-        "inset" => matches!(longhand, "top" | "right" | "bottom" | "left"),
-        "margin" | "padding" => longhand.starts_with(shorthand),
+        "text-decoration" => matches!(
+            longhand,
+            "text-decoration-color"
+                | "text-decoration-thickness"
+                | "text-decoration-line"
+                | "text-decoration-style"
+        ),
         _ => false,
     }
 }
@@ -711,5 +741,25 @@ mod tests {
         let none = animations(&declarations(&[("animation-name", "none")]));
         assert_eq!(none[0].name, None);
         assert!(none[0].phase(10.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod shorthand_tests {
+    use super::TransitionProperty;
+
+    #[test]
+    fn shorthands_cover_their_longhands() {
+        let property = |name: &str| TransitionProperty::Property(name.into());
+        assert!(property("border-color").covers("border-left-color"));
+        assert!(property("border").covers("border-top-width"));
+        assert!(property("border-top").covers("border-top-color"));
+        assert!(!property("border-top").covers("border-left-color"));
+        assert!(property("border-radius").covers("border-bottom-right-radius"));
+        assert!(property("margin").covers("margin-left"));
+        assert!(!property("margin").covers("margin-inline"));
+        assert!(property("gap").covers("column-gap"));
+        assert!(property("inset").covers("left"));
+        assert!(!property("background").covers("color"));
     }
 }
