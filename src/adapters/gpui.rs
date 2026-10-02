@@ -5900,7 +5900,8 @@ fn dynamic_style_method_name(conditions: &[RenderStyleCondition]) -> Option<&'st
             | RenderStyleCondition::Supports(_)
             | RenderStyleCondition::Container(_)
             | RenderStyleCondition::StartingStyle
-            | RenderStyleCondition::ActiveViewTransitionType(_) => true,
+            | RenderStyleCondition::ActiveViewTransitionType(_)
+            | RenderStyleCondition::ElementState { .. } => true,
         })
     {
         return None;
@@ -7586,6 +7587,14 @@ fn format_pseudo_conditions_metadata(conditions: &[RenderStyleCondition]) -> Str
             RenderStyleCondition::ActiveViewTransitionType(types) => {
                 format!("active-view-transition-type={:?}", types.join(","))
             }
+            RenderStyleCondition::ElementState {
+                pseudo,
+                ancestor,
+                negated,
+            } => format!(
+                "element-state={:?} ancestor={ancestor} negated={negated}",
+                pseudo.as_str()
+            ),
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -7609,6 +7618,22 @@ fn format_style_condition(condition: &RenderStyleCondition) -> String {
         RenderStyleCondition::StartingStyle => "@starting-style".to_owned(),
         RenderStyleCondition::ActiveViewTransitionType(types) => {
             format!(":active-view-transition-type({})", types.join(", "))
+        }
+        RenderStyleCondition::ElementState {
+            pseudo,
+            ancestor,
+            negated,
+        } => {
+            let state = if *negated {
+                format!(":not(:{pseudo})")
+            } else {
+                format!(":{pseudo}")
+            };
+            if *ancestor == 0 {
+                state
+            } else {
+                format!("ancestor {ancestor} up {state}")
+            }
         }
     }
 }

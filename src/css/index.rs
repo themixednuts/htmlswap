@@ -292,6 +292,7 @@ enum ConditionPart {
     Container(CompactString),
     StartingStyle,
     ActiveViewTransitionType(Vec<CompactString>),
+    ElementState(CompactString, u16, bool),
 }
 
 impl From<&RenderStyleCondition> for ConditionPart {
@@ -303,6 +304,11 @@ impl From<&RenderStyleCondition> for ConditionPart {
             RenderStyleCondition::Supports(value) => Self::Supports(value.clone()),
             RenderStyleCondition::Container(value) => Self::Container(value.clone()),
             RenderStyleCondition::StartingStyle => Self::StartingStyle,
+            RenderStyleCondition::ElementState {
+                pseudo,
+                ancestor,
+                negated,
+            } => Self::ElementState(pseudo.clone(), *ancestor, *negated),
             RenderStyleCondition::ActiveViewTransitionType(types) => {
                 Self::ActiveViewTransitionType(types.clone())
             }

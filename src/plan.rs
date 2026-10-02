@@ -1744,6 +1744,17 @@ pub enum RenderStyleCondition {
     /// `:active-view-transition-type(...)`: matches while a view transition
     /// with any of these types is active.
     ActiveViewTransitionType(Vec<CompactString>),
+    /// A state pseudo-class written on an ancestor compound, or negated:
+    /// `.card:hover .title` styles `.title` while its ancestor `ancestor`
+    /// levels up is hovered; `:not(:hover)` styles an element while it is
+    /// not. A state on the subject itself, not negated, is
+    /// [`RenderStyleCondition::PseudoClass`].
+    ElementState {
+        pseudo: CompactString,
+        /// Levels above the styled element: 1 is its parent.
+        ancestor: u16,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

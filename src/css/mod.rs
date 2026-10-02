@@ -115,13 +115,27 @@ impl CssSelector {
         self.selectors
             .0
             .iter()
-            .filter_map(|selector| {
-                if !selector_matches_with_dynamic(selector, element, true) {
-                    return None;
-                }
-
-                let conditions = selector_dynamic_conditions(selector);
-                (!conditions.is_empty()).then_some((selector.specificity(), conditions))
+            .flat_map(|selector| {
+                // Conditions that hold for the whole selector, such as a
+                // pseudo-element or an active view-transition type.
+                let global = selector_dynamic_conditions(selector)
+                    .into_iter()
+                    .filter(|condition| !matches!(condition, RenderStyleCondition::PseudoClass(_)))
+                    .collect::<Vec<_>>();
+                let components = selector.iter_raw_match_order().collect::<Vec<_>>();
+                state_alternatives(&components, 0, element, 0, false)
+                    .into_iter()
+                    .filter_map(|requirements| {
+                        let mut conditions = global.clone();
+                        for requirement in requirements {
+                            let condition = requirement.condition();
+                            if !conditions.contains(&condition) {
+                                conditions.push(condition);
+                            }
+                        }
+                        (!conditions.is_empty()).then_some((selector.specificity(), conditions))
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -1267,6 +1281,200 @@ fn pseudo_class_matches(
         // unconditionally or breaking consumers on a compatible parser update.
         _ => false,
     }
+}
+
+/// A state pseudo-class one way of matching a selector requires: on the
+/// element `levels` above the subject, possibly negated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StateRequirement {
+    pseudo: &'static str,
+    levels: u16,
+    negated: bool,
+}
+
+impl StateRequirement {
+    fn condition(&self) -> RenderStyleCondition {
+        if self.levels == 0 && !self.negated {
+            RenderStyleCondition::PseudoClass(CompactString::from(self.pseudo))
+        } else {
+            RenderStyleCondition::ElementState {
+                pseudo: CompactString::from(self.pseudo),
+                ancestor: self.levels,
+                negated: self.negated,
+            }
+        }
+    }
+}
+
+/// Every way `components` (in match order, from `index`) can match
+/// `element`, each with the state pseudo-classes it then requires. An empty
+/// result means no match. States on an element reached through a sibling
+/// combinator cannot be expressed as a condition of the styled element, so
+/// such ways are dropped rather than attached to the wrong element.
+fn state_alternatives(
+    components: &[&Component<'_>],
+    mut index: usize,
+    element: &StyleElement<'_, '_>,
+    levels: u16,
+    through_sibling: bool,
+) -> Vec<Vec<StateRequirement>> {
+    let mut own: Vec<Vec<StateRequirement>> = vec![Vec::new()];
+    while let Some(component) = components.get(index) {
+        if let Component::Combinator(combinator) = component {
+            let rest = combinator_state_alternatives(
+                *combinator,
+                components,
+                index + 1,
+                element,
+                levels,
+                through_sibling,
+            );
+            return cartesian(&own, &rest);
+        }
+        let alternatives =
+            component_state_alternatives(component, element, levels, through_sibling);
+        if alternatives.is_empty() {
+            return Vec::new();
+        }
+        own = cartesian(&own, &alternatives);
+        index += 1;
+    }
+    own
+}
+
+fn combinator_state_alternatives(
+    combinator: Combinator,
+    components: &[&Component<'_>],
+    next: usize,
+    element: &StyleElement<'_, '_>,
+    levels: u16,
+    through_sibling: bool,
+) -> Vec<Vec<StateRequirement>> {
+    let up = |ancestor: &StyleElement<'_, '_>, distance: u16| {
+        state_alternatives(
+            components,
+            next,
+            ancestor,
+            levels.saturating_add(distance),
+            through_sibling,
+        )
+    };
+    match combinator {
+        Combinator::Child => element
+            .parent()
+            .map(|parent| up(&parent, 1))
+            .unwrap_or_default(),
+        Combinator::Descendant | Combinator::DeepDescendant | Combinator::Deep => element
+            .ancestors_from_nearest()
+            .iter()
+            .zip(1_u16..)
+            .flat_map(|(ancestor, distance)| up(ancestor, distance))
+            .collect(),
+        Combinator::NextSibling => element
+            .previous_sibling()
+            .map(|sibling| state_alternatives(components, next, &sibling, levels, true))
+            .unwrap_or_default(),
+        Combinator::LaterSibling => element
+            .previous_siblings()
+            .iter()
+            .flat_map(|sibling| state_alternatives(components, next, sibling, levels, true))
+            .collect(),
+        // Pseudo-element and part combinators stay on the same element.
+        _ => state_alternatives(components, next, element, levels, through_sibling),
+    }
+}
+
+/// The ways one simple selector can match, each with its state needs.
+fn component_state_alternatives(
+    component: &Component<'_>,
+    element: &StyleElement<'_, '_>,
+    levels: u16,
+    through_sibling: bool,
+) -> Vec<Vec<StateRequirement>> {
+    let state = |pseudo: &'static str, negated: bool| {
+        if through_sibling {
+            Vec::new()
+        } else {
+            vec![vec![StateRequirement {
+                pseudo,
+                levels,
+                negated,
+            }]]
+        }
+    };
+    match component {
+        Component::NonTSPseudoClass(PseudoClass::ActiveViewTransitionType { .. }) => {
+            vec![Vec::new()]
+        }
+        Component::NonTSPseudoClass(pseudo_class) => {
+            match dynamic_pseudo_class_name(pseudo_class) {
+                Some(name) => state(name, false),
+                None if pseudo_class_matches(pseudo_class, element, true) => vec![Vec::new()],
+                None => Vec::new(),
+            }
+        }
+        Component::Is(selectors) | Component::Where(selectors) | Component::Any(_, selectors) => {
+            selectors
+                .iter()
+                .flat_map(|selector| {
+                    let components = selector.iter_raw_match_order().collect::<Vec<_>>();
+                    state_alternatives(&components, 0, element, levels, through_sibling)
+                })
+                .collect()
+        }
+        Component::Negation(selectors) => {
+            // :not(A, B) holds when no argument matches. A static match fails
+            // it outright; a single state requirement inverts into a negated
+            // one. Anything more complex is not expressible and does not
+            // match, rather than matching unconditionally.
+            let mut requirements = Vec::new();
+            for selector in selectors.iter() {
+                let components = selector.iter_raw_match_order().collect::<Vec<_>>();
+                let alternatives =
+                    state_alternatives(&components, 0, element, levels, through_sibling);
+                match alternatives.as_slice() {
+                    [] => {}
+                    [only] if only.is_empty() => return Vec::new(),
+                    [only] if only.len() == 1 => {
+                        let mut negated = only[0].clone();
+                        negated.negated = !negated.negated;
+                        requirements.push(negated);
+                    }
+                    _ => return Vec::new(),
+                }
+            }
+            vec![requirements]
+        }
+        _ => {
+            if simple_selector_matches(component, element, true) {
+                vec![Vec::new()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Combine two sets of alternatives: every pairing, merged.
+fn cartesian(
+    left: &[Vec<StateRequirement>],
+    right: &[Vec<StateRequirement>],
+) -> Vec<Vec<StateRequirement>> {
+    let mut out: Vec<Vec<StateRequirement>> = Vec::new();
+    for a in left {
+        for b in right {
+            let mut merged = a.clone();
+            for requirement in b {
+                if !merged.contains(requirement) {
+                    merged.push(requirement.clone());
+                }
+            }
+            if !out.contains(&merged) {
+                out.push(merged);
+            }
+        }
+    }
+    out
 }
 
 fn selector_dynamic_conditions(selector: &Selector<'_>) -> Vec<RenderStyleCondition> {

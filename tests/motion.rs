@@ -275,3 +275,70 @@ fn view_transition_rules_keep_names_classes_and_types() {
         [".5"]
     );
 }
+
+#[test]
+fn state_pseudo_classes_bind_to_the_element_they_are_written_on() {
+    fn colors<'a>(element: &'a RenderElement, condition: &RenderStyleCondition) -> Vec<&'a str> {
+        variant_values(element, condition, &StyleProperty::Color)
+    }
+    let plan = compile(
+        r#"
+        <style>
+          .title { color: #000001; }
+          .card:hover .title { color: #000002; }
+          .card > .title:focus { color: #000003; }
+          .idle:not(:hover) { color: #000004; }
+          .badge + .title:hover { color: #000005; }
+          .card:hover + .after { color: #000006; }
+        </style>
+        <div class="card" id="card">
+          <span class="badge">B</span>
+          <h2 class="title" id="title">Title</h2>
+        </div>
+        <p class="after" id="after">After</p>
+        <p class="idle" id="idle">Idle</p>
+        "#,
+    );
+    let title = find(&plan.nodes, "title").expect("title");
+    assert_eq!(
+        colors(
+            title,
+            &RenderStyleCondition::ElementState {
+                pseudo: "hover".into(),
+                ancestor: 1,
+                negated: false
+            }
+        ),
+        ["#000002"],
+        "the card's hover, one level up, not the title's own"
+    );
+    assert!(
+        colors(title, &RenderStyleCondition::PseudoClass("hover".into())).contains(&"#000005"),
+        "a state on the subject stays a plain pseudo-class"
+    );
+    assert_eq!(
+        colors(title, &RenderStyleCondition::PseudoClass("focus".into())),
+        ["#000003"]
+    );
+    let idle = find(&plan.nodes, "idle").expect("idle");
+    assert_eq!(
+        colors(
+            idle,
+            &RenderStyleCondition::ElementState {
+                pseudo: "hover".into(),
+                ancestor: 0,
+                negated: true
+            }
+        ),
+        ["#000004"],
+        ":not(:hover) is a negated state, not never-matching"
+    );
+    let after = find(&plan.nodes, "after").expect("after");
+    assert!(
+        after.style_variants.iter().all(|variant| variant
+            .declarations
+            .iter()
+            .all(|d| d.value.as_str() != "#000006")),
+        "a sibling's state is not expressible and is not misattached"
+    );
+}

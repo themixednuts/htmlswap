@@ -2736,6 +2736,15 @@ fn conditioned_style_rule(
                     selector.trim_start()
                 );
             }
+            RenderStyleCondition::ElementState {
+                pseudo,
+                ancestor: 0,
+                negated: true,
+            } => selector.push_str(&format!(":not(:{pseudo})")),
+            // A state on an ancestor needs that ancestor's selector, which a
+            // per-element rule does not carry, so the rule is not emitted
+            // rather than styling the element on its own state.
+            RenderStyleCondition::ElementState { .. } => return None,
         }
     }
     let mut rule = String::new();

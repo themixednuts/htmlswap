@@ -844,6 +844,14 @@ fn style_conditions_signature(conditions: &[RenderStyleCondition]) -> String {
             RenderStyleCondition::ActiveViewTransitionType(types) => {
                 format!("active-view-transition-type:{}", types.join(","))
             }
+            RenderStyleCondition::ElementState {
+                pseudo,
+                ancestor,
+                negated,
+            } => format!(
+                "element-state:{}{pseudo}@{ancestor}",
+                if *negated { "!" } else { "" }
+            ),
         })
         .collect::<Vec<_>>()
         .join("|")
