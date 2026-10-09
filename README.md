@@ -8,6 +8,13 @@ different UI targets:
 
 - **GPUI** — raw `gpui::div()` builder chains (Zed's UI framework)
 - **gpui-components** — widget-level output (`Button`, `TabBar`, `Input`, `TitleBar`, …)
+
+Both GPUI adapters target either Zed's `gpui` 0.2 with `gpui-component` 0.5
+(the default) or GPUI Kit 0.7: `gpui-pre` 0.3, which generated code refers to
+as `gpui`, with `gpui-component` 0.7 (`--gpui-kit`, or
+`GpuiAdapterOptions::target = GpuiTarget::Kit`). Styles come from the typed
+CSS lowering (`htmlswap::computed`) through one GPUI style plan
+(`computed::gpui::plan`), which runtime renderers can apply too.
 - **Svelte 5** — components with runes
 - **HTML / text** — round-trip and debugging output
 
@@ -56,6 +63,7 @@ htmlswap compile src/view.dc.html --source dc --adapter gpui-components -o view.
 
 # raw GPUI, Svelte, or debug text
 htmlswap compile src/view.dc.html --source dc --adapter gpui -o view.rs
+htmlswap compile src/view.dc.html --source dc --adapter gpui --gpui-kit -o view.rs
 htmlswap compile src/view.dc.html --source dc --adapter svelte -o View.svelte
 htmlswap compile src/view.dc.html --source dc --adapter text
 
@@ -70,9 +78,9 @@ htmlswap compile src/view.html --tailwind \
   --adapter gpui -o view.rs
 ```
 
-Or from a `build.rs` (see `examples/gpui_smoke/`): compile with
-`Frontend::dc()` + `GpuiComponentsAdapter`, write to `OUT_DIR`, and
-`include!` the generated file.
+Or from a `build.rs` (see `examples/gpui_smoke/`, and `examples/gpui_kit_smoke/`
+for GPUI Kit): compile with `Frontend::dc()` + `GpuiComponentsAdapter`, write to
+`OUT_DIR`, and `include!` the generated file.
 
 Tailwind remains the authoritative CSS transformer; htmlswap feeds its output
 through the ordinary CSS and render-IR pipeline. See

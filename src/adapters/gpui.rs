@@ -39,8 +39,11 @@ use crate::source::{GeneratedSourceMap, GeneratedSpan, SourceMapping, SourceMapp
 use crate::style::{StyleDeclaration, StyleProperty, StyleToken, StyleValue};
 
 pub const GPUI_CRATE_VERSION: &str = "0.2.2";
+/// The `gpui-pre` release GPUI Kit 0.7 builds on.
+pub const GPUI_KIT_GPUI_VERSION: &str = "0.3.7";
+/// The GPUI Kit release (`gpui-component`, `gpui-base`).
+pub const GPUI_KIT_VERSION: &str = "0.7";
 pub const GPUI_LAYER_ID: &str = "gpui";
-const GPUI_COMPONENT_THEME_CRATE_VERSION: &str = "0.5.1";
 const GPUI_MATERIAL_SYMBOL_ICON_HELPER: &str = r#"struct HtmlswapMaterialSymbolIcon {
     name: String,
 }
@@ -169,6 +172,8 @@ pub enum ThemeEmission {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpuiAdapterOptions {
     pub component_name: CompactString,
+    /// The GPUI release the generated code builds against.
+    pub target: GpuiTarget,
     pub include_dependency_header: bool,
     pub include_imports: bool,
     pub emit_source_comments: bool,
@@ -184,11 +189,57 @@ impl Default for GpuiAdapterOptions {
     }
 }
 
+/// The GPUI release generated code builds against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum GpuiTarget {
+    /// Zed's `gpui` 0.2 from crates.io, with `gpui-component` 0.5.
+    #[default]
+    Zed,
+    /// GPUI Kit 0.7: `gpui-pre` 0.3 (as `gpui`) with `gpui-component` and
+    /// `gpui-base` 0.7.
+    Kit,
+}
+
+impl GpuiTarget {
+    /// The `gpui` dependency.
+    #[must_use]
+    pub fn gpui_dependency(self) -> TargetDependency {
+        match self {
+            Self::Zed => TargetDependency::crates_io("gpui", GPUI_CRATE_VERSION),
+            Self::Kit => {
+                TargetDependency::crates_io("gpui-pre", GPUI_KIT_GPUI_VERSION).with_name("gpui")
+            }
+        }
+    }
+
+    /// The `gpui-component` dependency.
+    #[must_use]
+    pub fn component_dependency(self) -> TargetDependency {
+        match self {
+            Self::Zed => TargetDependency::crates_io(
+                "gpui-component",
+                crate::adapters::gpui_components::GPUI_COMPONENT_CRATE_VERSION,
+            ),
+            Self::Kit => TargetDependency::crates_io("gpui-component", GPUI_KIT_VERSION),
+        }
+    }
+
+    /// What the target's GPUI can draw beyond its stock styles.
+    #[must_use]
+    pub const fn features(self) -> crate::computed::gpui::Features {
+        crate::computed::gpui::Features {
+            grid_tracks: false,
+            inset_shadows: matches!(self, Self::Kit),
+        }
+    }
+}
+
 impl GpuiAdapterOptions {
     #[must_use]
     pub fn gpui() -> Self {
         Self {
             component_name: "HtmlswapView".into(),
+            target: GpuiTarget::Zed,
             include_dependency_header: true,
             include_imports: true,
             emit_source_comments: true,
@@ -591,7 +642,7 @@ fn read_source_map_marker(
 pub(crate) trait GpuiTargetLayer {
     fn id(&self) -> &'static str;
     fn claim(&self) -> LayerClaim;
-    fn dependencies(&self) -> Vec<TargetDependency>;
+    fn dependencies(&self, target: GpuiTarget) -> Vec<TargetDependency>;
     fn write_imports(&self, output: &mut String);
     fn write_helpers(&self, _output: &mut String) {}
     fn element_spec(
@@ -842,8 +893,8 @@ impl GpuiTargetLayer for GpuiBaseLayer {
         LayerClaim::All
     }
 
-    fn dependencies(&self) -> Vec<TargetDependency> {
-        vec![TargetDependency::crates_io("gpui", GPUI_CRATE_VERSION)]
+    fn dependencies(&self, target: GpuiTarget) -> Vec<TargetDependency> {
+        vec![target.gpui_dependency()]
     }
 
     fn write_imports(&self, output: &mut String) {
@@ -1587,7 +1638,10 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             sources: None,
             source_markers: Vec::new(),
             next_source_marker: 0,
-            style_printer: StylePrinter::default(),
+            style_printer: StylePrinter {
+                features: options.target.features(),
+                ..StylePrinter::default()
+            },
             group_names: HashMap::new(),
             group_targets: HashMap::new(),
             emitted_groups: HashSet::new(),
@@ -1802,7 +1856,21 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
     }
 
     fn write_gpui_text_input_struct(&self, output: &mut String) {
-        output.push_str(GPUI_TEXT_INPUT_HELPER);
+        match self.options.target {
+            GpuiTarget::Zed => output.push_str(GPUI_TEXT_INPUT_HELPER),
+            // gpui-pre focuses through the app and aligns painted lines.
+            GpuiTarget::Kit => output.push_str(
+                &GPUI_TEXT_INPUT_HELPER
+                    .replace(
+                        "window.focus(&self.focus_handle);",
+                        "window.focus(&self.focus_handle, _cx);",
+                    )
+                    .replace(
+                        "line.paint(bounds.origin, window.line_height(), window, cx)",
+                        "line.paint(bounds.origin, window.line_height(), gpui::TextAlign::Left, None, window, cx)",
+                    ),
+            ),
+        }
     }
 
     fn write_tooltip_view_struct(&self, output: &mut String) {
@@ -2079,15 +2147,12 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                 continue;
             }
 
-            for dependency in layer.dependencies() {
+            for dependency in layer.dependencies(self.options.target) {
                 dependencies.insert(dependency, self.cx);
             }
         }
         if self.used_gpui_component_theme {
-            dependencies.insert(
-                TargetDependency::crates_io("gpui-component", GPUI_COMPONENT_THEME_CRATE_VERSION),
-                self.cx,
-            );
+            dependencies.insert(self.options.target.component_dependency(), self.cx);
         }
         dependencies.into_vec()
     }
@@ -2098,8 +2163,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         for dependency in dependencies {
             writeln!(
                 output,
-                "// {} = \"{}\"",
-                dependency.package, dependency.version_req
+                "// {} = {}",
+                dependency.key(),
+                dependency.cargo_value()
             )
             .expect("writing to String cannot fail");
         }

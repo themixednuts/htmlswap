@@ -386,6 +386,9 @@ pub trait Layer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetDependency {
+    /// The name code refers to the crate by, when it differs from the
+    /// package (`gpui = { package = "gpui-pre" }`).
+    pub name: Option<CompactString>,
     pub package: CompactString,
     pub version_req: CompactString,
     pub source: DependencySource,
@@ -400,11 +403,37 @@ impl TargetDependency {
         version_req: impl Into<CompactString>,
     ) -> Self {
         Self {
+            name: None,
             package: package.into(),
             version_req: version_req.into(),
             source: DependencySource::CratesIo,
             default_features: true,
             features: Vec::new(),
+        }
+    }
+
+    /// Refer to the package by another name, as Cargo's `package` key does.
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<CompactString>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// The name code refers to the crate by.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.package)
+    }
+
+    /// The dependency as a `Cargo.toml` value.
+    #[must_use]
+    pub fn cargo_value(&self) -> String {
+        match &self.name {
+            None => format!("\"{}\"", self.version_req),
+            Some(_) => format!(
+                "{{ package = \"{}\", version = \"{}\" }}",
+                self.package, self.version_req
+            ),
         }
     }
 
@@ -540,7 +569,7 @@ impl DependencySet {
     }
 
     pub fn insert(&mut self, dependency: TargetDependency, cx: &mut AdapterContext) {
-        if let Some(existing) = self.dependencies.get_mut(&dependency.package) {
+        if let Some(existing) = self.dependencies.get_mut(dependency.key()) {
             if existing.version_req != dependency.version_req
                 || existing.source != dependency.source
             {
@@ -562,7 +591,7 @@ impl DependencySet {
         }
 
         self.dependencies
-            .insert(dependency.package.clone(), dependency);
+            .insert(dependency.key().into(), dependency);
     }
 
     #[must_use]

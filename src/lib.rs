@@ -39,8 +39,8 @@ pub use adapter::{
     TargetDependency, TargetSourceFile,
 };
 pub use adapters::gpui::{
-    GPUI_CRATE_VERSION, GPUI_LAYER_ID, GpuiAdapter, GpuiAdapterOptions, GpuiOutput,
-    RustFormatOptions, ThemeEmission,
+    GPUI_CRATE_VERSION, GPUI_KIT_GPUI_VERSION, GPUI_KIT_VERSION, GPUI_LAYER_ID, GpuiAdapter,
+    GpuiAdapterOptions, GpuiOutput, GpuiTarget, RustFormatOptions, ThemeEmission,
 };
 pub use adapters::gpui_components::{
     GPUI_COMPONENT_CRATE_VERSION, GPUI_COMPONENTS_LAYER_ID, GpuiComponentsAdapter,

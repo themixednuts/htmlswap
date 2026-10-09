@@ -4,10 +4,10 @@ use crate::adapter::{
 };
 use crate::adapters::gpui::{
     AccessibilityEmission, ActionEmission, ChildEmission, GPUI_LAYER_ID, GpuiAdapterOptions,
-    GpuiElementContext, GpuiElementSpec, GpuiOutput, GpuiTargetLayer, IdAttributeEmission,
-    StateActionEmission, StyleEmission, ThemeEmission, TitleAttributeEmission, adapt_with_layers,
-    attribute_span, attribute_value, component_text_input_host_expression, element_id,
-    gpui_base_layer, has_boolean_attribute, is_material_symbol_element, rust_string,
+    GpuiElementContext, GpuiElementSpec, GpuiOutput, GpuiTarget, GpuiTargetLayer,
+    IdAttributeEmission, StateActionEmission, StyleEmission, ThemeEmission, TitleAttributeEmission,
+    adapt_with_layers, attribute_span, attribute_value, component_text_input_host_expression,
+    element_id, gpui_base_layer, has_boolean_attribute, is_material_symbol_element, rust_string,
     text_only_children,
 };
 use crate::adapters::gpui_reverse::{GpuiImportMode, import_gpui_target};
@@ -126,11 +126,8 @@ impl GpuiTargetLayer for GpuiComponentsLayer {
         ])
     }
 
-    fn dependencies(&self) -> Vec<TargetDependency> {
-        vec![TargetDependency::crates_io(
-            "gpui-component",
-            GPUI_COMPONENT_CRATE_VERSION,
-        )]
+    fn dependencies(&self, target: GpuiTarget) -> Vec<TargetDependency> {
+        vec![target.component_dependency()]
     }
 
     fn write_imports(&self, output: &mut String) {

@@ -1627,3 +1627,36 @@ fn gpui_adapter_emits_ancestor_states_as_gpui_groups() {
     assert!(code.contains("preserved CSS: conditional CSS"), "{code}");
     assert!(adapter_context.diagnostics().is_empty());
 }
+
+#[test]
+fn gpui_adapter_targets_gpui_kit() {
+    let compiled = Compiler::new().compile_fragment(
+        r#"<div style="box-shadow: inset 0 1px 2px #0004">Kit</div>"#,
+        &CompileAssets::new(),
+    );
+    assert!(compiled.diagnostics.is_empty());
+
+    let mut adapter_context = AdapterContext::new();
+    let output = GpuiAdapter::new(GpuiAdapterOptions {
+        target: htmlswap::GpuiTarget::Kit,
+        ..GpuiAdapterOptions::default()
+    })
+    .adapt(&compiled.value, &mut adapter_context)
+    .expect("GPUI adapter should emit code");
+    let code = output.code();
+    syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
+
+    // GPUI Kit builds on gpui-pre, which code refers to as `gpui`.
+    assert!(
+        code.contains(r#"// gpui = { package = "gpui-pre", version = "0.3.7" }"#),
+        "{code}"
+    );
+    assert_eq!(
+        output.dependencies()[0].cargo_value(),
+        r#"{ package = "gpui-pre", version = "0.3.7" }"#
+    );
+    // gpui-pre draws inset shadows.
+    assert!(code.contains("inset: true"), "{code}");
+    assert!(!code.contains("preserved CSS: box-shadow"), "{code}");
+    assert!(adapter_context.diagnostics().is_empty());
+}

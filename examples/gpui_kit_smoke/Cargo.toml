@@ -1,0 +1,14 @@
+[package]
+name = "htmlswap-gpui-kit-smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+build = "build.rs"
+
+# The dependencies htmlswap's GPUI Kit target asks for.
+[dependencies]
+gpui = { package = "gpui-pre", version = "0.3.7" }
+gpui-component = "0.7"
+
+[build-dependencies]
+htmlswap = { path = "../.." }

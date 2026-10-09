@@ -14,12 +14,12 @@ use htmlswap::{
     CompilerOptions, CompilerParallelism, CompilerResourceOptions, DEFAULT_RESOURCE_MAX_BYTES,
     DEFAULT_TAILWIND_MAX_OUTPUT_BYTES, DEFAULT_TAILWIND_TIMEOUT, DcComponentFragment, Diagnostics,
     EmitContext, EmitError, Emitter, Frontend, GeneratedFile, GpuiAdapter, GpuiAdapterOptions,
-    GpuiComponentsAdapter, GpuiComponentsAdapterOptions, Importer, LayerId, LayoutDebugOptions,
-    RenderNode, RenderPlan, RoundTripComparison, RoundTripOptions, RouteConfig, RouteTarget,
-    RustFormatOptions, Severity, SourceAsset, SourceFrontendKind, SourceMap, StyleProperty,
-    SvelteAdapter, SvelteAdapterOptions, TailwindCli, TailwindProvider, TargetArtifact,
-    TextEmitter, ThemeEmission, UiRole, compare_roundtrip_plans, inline_dc_component_imports,
-    instrument_layout_snapshot_html_with_sources,
+    GpuiComponentsAdapter, GpuiComponentsAdapterOptions, GpuiTarget, Importer, LayerId,
+    LayoutDebugOptions, RenderNode, RenderPlan, RoundTripComparison, RoundTripOptions, RouteConfig,
+    RouteTarget, RustFormatOptions, Severity, SourceAsset, SourceFrontendKind, SourceMap,
+    StyleProperty, SvelteAdapter, SvelteAdapterOptions, TailwindCli, TailwindProvider,
+    TargetArtifact, TextEmitter, ThemeEmission, UiRole, compare_roundtrip_plans,
+    inline_dc_component_imports, instrument_layout_snapshot_html_with_sources,
 };
 const DEFAULT_RESOURCE_TIMEOUT_MS: u64 = 10_000;
 
@@ -184,6 +184,11 @@ struct CompileCommand {
     /// Disable generated Rust imports for Rust adapters.
     #[arg(long)]
     no_imports: bool,
+
+    /// Generate GPUI code for GPUI Kit 0.7 (gpui-pre 0.3) instead of Zed's
+    /// gpui 0.2.
+    #[arg(long)]
+    gpui_kit: bool,
 }
 
 impl CompileCommand {
@@ -420,6 +425,11 @@ impl CompileCommand {
         };
         GpuiAdapterOptions {
             component_name: self.component_name.as_str().into(),
+            target: if self.gpui_kit {
+                GpuiTarget::Kit
+            } else {
+                GpuiTarget::Zed
+            },
             include_dependency_header: !self.no_dependency_header,
             include_imports: !self.no_imports,
             emit_source_comments: !self.no_source_comments,
