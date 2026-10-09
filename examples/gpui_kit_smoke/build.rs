@@ -77,6 +77,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "htmlswap_rem_size",
         "htmlswap_viewport",
         "inset: false",
+        "gpui_base::motion::transition(",
+        "HtmlswapMotionColor(",
+        ".on_hover(",
     ] {
         if !base.contains(expected) {
             return Err(format!("generated base view lacks `{expected}`").into());

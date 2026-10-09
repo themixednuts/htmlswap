@@ -1660,3 +1660,70 @@ fn gpui_adapter_targets_gpui_kit() {
     assert!(!code.contains("preserved CSS: box-shadow"), "{code}");
     assert!(adapter_context.diagnostics().is_empty());
 }
+
+#[test]
+fn gpui_adapter_animates_hover_transitions_on_gpui_kit() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        r#"
+            .button { background: #222222; transition: background-color 200ms linear; }
+            .button:hover { background: #444444; color: #ffffff; }
+        "#,
+    );
+    let compiled = Compiler::new().compile_fragment(r#"<div class="button">Hover</div>"#, &assets);
+    assert!(compiled.diagnostics.is_empty());
+
+    let adapt = |target| {
+        let mut adapter_context = AdapterContext::new();
+        let output = GpuiAdapter::new(GpuiAdapterOptions {
+            target,
+            ..GpuiAdapterOptions::default()
+        })
+        .adapt(&compiled.value, &mut adapter_context)
+        .expect("GPUI adapter should emit code");
+        assert!(adapter_context.diagnostics().is_empty());
+        syn::parse_file(output.code()).expect("GPUI adapter should emit syntactically valid Rust");
+        (
+            output.code().split_whitespace().collect::<String>(),
+            output.dependencies().to_vec(),
+        )
+    };
+
+    let (kit, dependencies) = adapt(htmlswap::GpuiTarget::Kit);
+    for expected in [
+        r#"letmutthis"#,
+        r#"_window.use_keyed_state(gpui::ElementId::Name(gpui::SharedString::from("htmlswap_motion_"#,
+        r#"gpui_base::motion::transition((gpui::ElementId::Name(gpui::SharedString::from("htmlswap_motion_"#,
+        r#""background-color","#,
+        r#"ifhtmlswap_motion_1_is_hovered{"#,
+        r#"{HtmlswapMotionColor(gpui::rgb(0x444444))}else{HtmlswapMotionColor(gpui::rgb(0x222222))}"#,
+        r#"gpui_base::motion::Transition::new(std::time::Duration::from_secs_f32(0.2_f32)).easing(gpui_base::motion::Easing::Linear)"#,
+        r#".bg(htmlswap_motion_"#,
+        // What does not transition stays a hover refinement.
+        r#".hover(|this|this.text_color(gpui::rgb(0xFFFFFF)))"#,
+        r#".on_hover({lethovered="#,
+        "structHtmlswapMotionColor(gpui::Rgba);",
+    ] {
+        let expected = expected.replace("letmutthis", "");
+        assert!(kit.contains(&expected), "missing {expected}:\n{kit}");
+    }
+    assert!(!kit.contains(".hover(|this|this.bg("), "{kit}");
+    assert!(
+        dependencies
+            .iter()
+            .any(|dependency| dependency.package == "gpui-base")
+    );
+
+    // Zed's gpui has no GPUI Kit motion: hover applies its end state.
+    let (zed, dependencies) = adapt(htmlswap::GpuiTarget::Zed);
+    assert!(
+        zed.contains(".hover(|this|this.bg(gpui::rgb(0x444444)).text_color(gpui::rgb(0xFFFFFF)))"),
+        "{zed}"
+    );
+    assert!(!zed.contains("gpui_base"), "{zed}");
+    assert!(
+        !dependencies
+            .iter()
+            .any(|dependency| dependency.package == "gpui-base")
+    );
+}

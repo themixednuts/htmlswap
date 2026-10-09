@@ -16,7 +16,7 @@ use super::style::{
     TrackSize, Visibility, WhiteSpace,
 };
 use super::values::{Length, LengthAuto, LengthPercentage};
-use super::{Corners, DecorationStyle, Rgba};
+use super::{AnimatableProperty, Corners, DecorationStyle, Rgba};
 
 /// GPUI features beyond its stock styles.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -301,6 +301,52 @@ const MIXED: &str =
     "GPUI lengths are either absolute or relative; calc() mixing both is not supported";
 
 impl GpuiStyle {
+    /// Leave `property` unset, for a renderer that animates it separately.
+    pub fn clear(&mut self, property: AnimatableProperty) {
+        use AnimatableProperty as P;
+        match property {
+            P::Opacity => self.opacity = None,
+            P::Color => self.text_color = None,
+            P::BackgroundColor => self.background = None,
+            P::BorderTopColor | P::BorderRightColor | P::BorderBottomColor | P::BorderLeftColor => {
+                self.border_color = None;
+            }
+            P::BorderTopWidth => self.border_widths.top = None,
+            P::BorderRightWidth => self.border_widths.right = None,
+            P::BorderBottomWidth => self.border_widths.bottom = None,
+            P::BorderLeftWidth => self.border_widths.left = None,
+            P::BorderTopLeftRadius => self.corner_radii.top_left = None,
+            P::BorderTopRightRadius => self.corner_radii.top_right = None,
+            P::BorderBottomRightRadius => self.corner_radii.bottom_right = None,
+            P::BorderBottomLeftRadius => self.corner_radii.bottom_left = None,
+            P::Width => self.width = None,
+            P::Height => self.height = None,
+            P::MinWidth => self.min_width = None,
+            P::MinHeight => self.min_height = None,
+            P::MaxWidth => self.max_width = None,
+            P::MaxHeight => self.max_height = None,
+            P::Top => self.inset.top = None,
+            P::Right => self.inset.right = None,
+            P::Bottom => self.inset.bottom = None,
+            P::Left => self.inset.left = None,
+            P::MarginTop => self.margin.top = None,
+            P::MarginRight => self.margin.right = None,
+            P::MarginBottom => self.margin.bottom = None,
+            P::MarginLeft => self.margin.left = None,
+            P::PaddingTop => self.padding.top = None,
+            P::PaddingRight => self.padding.right = None,
+            P::PaddingBottom => self.padding.bottom = None,
+            P::PaddingLeft => self.padding.left = None,
+            P::RowGap => self.row_gap = None,
+            P::ColumnGap => self.column_gap = None,
+            P::FontSize => self.font_size = None,
+            P::FlexGrow => self.flex_grow = None,
+            P::FlexShrink => self.flex_shrink = None,
+            // Not drawn by GPUI, or drawn outside the style.
+            P::Translate | P::LetterSpacing | P::TextDecorationColor => {}
+        }
+    }
+
     fn limit(&mut self, property: &'static str, reason: &'static str) {
         let note = Note { property, reason };
         if !self.limits.contains(&note) {

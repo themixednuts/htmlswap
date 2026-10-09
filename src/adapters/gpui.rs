@@ -639,6 +639,21 @@ fn read_source_map_marker(
     Ok(Some(id))
 }
 
+const GPUI_KIT_MOTION_COLOR_HELPER: &str = r#"/// A color that transitions in premultiplied RGBA, as CSS colors do.
+#[derive(Clone, Copy, PartialEq)]
+struct HtmlswapMotionColor(gpui::Rgba);
+
+impl gpui_base::animation::Lerp for HtmlswapMotionColor {
+    fn lerp(&self, target: &Self, t: f32) -> Self {
+        let premultiply = |color: gpui::Rgba| [color.r * color.a, color.g * color.a, color.b * color.a, color.a];
+        let (from, to) = (premultiply(self.0), premultiply(target.0));
+        let [r, g, b, a]: [f32; 4] = std::array::from_fn(|index| from[index] + (to[index] - from[index]) * t);
+        let unpremultiply = |channel: f32| if a > 0.0 { channel / a } else { 0.0 };
+        Self(gpui::Rgba { r: unpremultiply(r), g: unpremultiply(g), b: unpremultiply(b), a })
+    }
+}
+"#;
+
 pub(crate) trait GpuiTargetLayer {
     fn id(&self) -> &'static str;
     fn claim(&self) -> LayerClaim;
@@ -1604,6 +1619,11 @@ struct GpuiCodegen<'a, 'layers, 'cx> {
     group_targets: HashMap<(usize, u16), usize>,
     /// Elements whose `.group(..)` has been printed.
     emitted_groups: HashSet<usize>,
+    /// Statements the element being rendered needs before its expression,
+    /// such as GPUI Kit motion values.
+    element_preamble: Vec<String>,
+    used_motion: bool,
+    used_motion_color: bool,
 }
 
 impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
@@ -1645,6 +1665,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             group_names: HashMap::new(),
             group_targets: HashMap::new(),
             emitted_groups: HashSet::new(),
+            element_preamble: Vec::new(),
+            used_motion: false,
+            used_motion_color: false,
         }
     }
 
@@ -1738,6 +1761,10 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         }
         if self.used_dynamic_length_helper {
             self.write_dynamic_length_helper(&mut output);
+            output.push('\n');
+        }
+        if self.used_motion_color {
+            output.push_str(GPUI_KIT_MOTION_COLOR_HELPER);
             output.push('\n');
         }
         self.write_layer_helpers(&mut output);
@@ -2154,6 +2181,12 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         if self.used_gpui_component_theme {
             dependencies.insert(self.options.target.component_dependency(), self.cx);
         }
+        if self.used_motion {
+            dependencies.insert(
+                TargetDependency::crates_io("gpui-base", GPUI_KIT_VERSION),
+                self.cx,
+            );
+        }
         dependencies.into_vec()
     }
 
@@ -2394,6 +2427,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             scope,
         );
         self.push_style_methods(&mut expression, element, &mut comments, &spec, scope);
+        let preamble = std::mem::take(&mut self.element_preamble);
         self.push_accessibility_methods(&mut expression, element, &mut comments, &spec);
         self.push_title_bar_interaction_methods(&mut expression, element, &spec, scope);
         self.push_action_methods(&mut expression, element, &mut comments, &spec, scope);
@@ -2472,6 +2506,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         }
 
         expression = self.wrap_title_tooltip_if_needed(expression, element, &spec, scope);
+        if !preamble.is_empty() {
+            expression = format!("{{\n{}\n{expression}\n}}", preamble.join("\n"));
+        }
         self.with_local_comments(expression, depth, &comments)
     }
 
@@ -2956,6 +2993,18 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                     variant.span.or(element.span),
                     SourceMappingKind::Style,
                 ));
+            } else if let Some(refinement) = self.kit_hover_transition(
+                element,
+                variant,
+                &computed,
+                &scope.computed,
+                &whole,
+                scope,
+            ) {
+                if let Some(method) = refinement {
+                    let method = self.mark_source(method, variant.span, SourceMappingKind::Style);
+                    push_method(expression, 0, &method);
+                }
             } else if let Some((method, approximate)) =
                 self.typed_variant_method(element, variant, &computed, &scope.computed, &whole)
             {
@@ -3054,6 +3103,184 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         }
         push_method(expression, 0, &format!(".group({name:?})"));
         self.emitted_groups.insert(address);
+    }
+
+    /// GPUI Kit: animate what a `:hover` rule changes and the element's
+    /// `transition` covers, with `gpui_base::motion`. Queues the hover state
+    /// and motion values as preamble statements and pushes their setters;
+    /// returns the `.hover(..)` refinement for the rest of the rule, if any.
+    /// `None` when the rule does not transition, so it is emitted as usual.
+    #[allow(clippy::too_many_lines)]
+    fn kit_hover_transition(
+        &mut self,
+        element: &RenderElement,
+        variant: &RenderStyleVariant,
+        computed: &ComputedScope,
+        parent: &ComputedScope,
+        whole: &ComputedStyle,
+        scope: &RenderScope,
+    ) -> Option<Option<String>> {
+        use crate::computed::gpui::Absolute;
+        use crate::computed::{AnimatableProperty as P, AnimatedValue, Underlying};
+
+        if self.options.target != GpuiTarget::Kit
+            || variant.conditions != [RenderStyleCondition::PseudoClass("hover".into())]
+            || element_has_hover_action(element)
+        {
+            return None;
+        }
+        let transitions = crate::motion::transitions(element.styles.iter());
+        if transitions.is_empty()
+            || variant
+                .declarations
+                .iter()
+                .any(|style| self.uses_theme_binding(style))
+        {
+            return None;
+        }
+        let resolved = variant
+            .declarations
+            .iter()
+            .map(|declaration| {
+                computed
+                    .resolve(declaration)
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut unsupported = false;
+        let hover_style =
+            ComputedStyle::compute(&resolved, &computed.style_context(parent), |_, _| {
+                unsupported = true;
+            });
+        if unsupported {
+            return None;
+        }
+        let mut hovered = whole.clone();
+        hovered.overlay(&hover_style);
+        let underlying = Underlying {
+            current_color: parent.color(),
+            font_size: parent.font_size(),
+        };
+
+        let base = self.generated_id("motion");
+        let state_key = gpui_generated_element_id_expression(&format!("{base}_hover"), scope);
+        let channel_key = gpui_generated_element_id_expression(&base, scope);
+        let is_hovered = format!("{base}_is_hovered");
+        let mut statements = Vec::new();
+        let mut setters = Vec::new();
+        let mut animated = Vec::new();
+        let mut border_color = false;
+        for property in P::ALL {
+            if matches!(
+                property,
+                P::Translate | P::LetterSpacing | P::TextDecorationColor
+            ) {
+                continue;
+            }
+            let is_border_color = matches!(
+                property,
+                P::BorderTopColor | P::BorderRightColor | P::BorderBottomColor | P::BorderLeftColor
+            );
+            if is_border_color && border_color {
+                // GPUI draws one border color, animated once.
+                animated.push(property);
+                continue;
+            }
+            let Some(transition) =
+                crate::motion::Transition::for_property(&transitions, property.css_name())
+                    .filter(|transition| transition.is_active())
+            else {
+                continue;
+            };
+            let from = property
+                .get(whole)
+                .or_else(|| property.initial(&underlying));
+            let to = property
+                .get(&hovered)
+                .or_else(|| property.initial(&underlying));
+            let (Some(from), Some(to)) = (from, to) else {
+                continue;
+            };
+            if from == to {
+                continue;
+            }
+            let values = match (from, to) {
+                (AnimatedValue::Color(_), AnimatedValue::Color(_)) => {
+                    let color = |value: AnimatedValue| {
+                        value.rgba().map(|rgba| {
+                            format!(
+                                "HtmlswapMotionColor({})",
+                                crate::adapters::gpui_style::color(rgba)
+                            )
+                        })
+                    };
+                    color(from).zip(color(to))
+                }
+                (AnimatedValue::Number(from), AnimatedValue::Number(to)) => Some((
+                    format!("{}_f32", format_float(from)),
+                    format!("{}_f32", format_float(to)),
+                )),
+                (AnimatedValue::Length(from), AnimatedValue::Length(to)) => {
+                    match (Absolute::new(from), Absolute::new(to)) {
+                        (Some(from), Some(to)) => Some((
+                            self.style_printer.pixels(from),
+                            self.style_printer.pixels(to),
+                        )),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some((from_value, to_value)) = values else {
+                continue;
+            };
+            let Some(setter) = kit_motion_setter(property) else {
+                continue;
+            };
+            let variable = format!("{base}_{}", property.css_name().replace('-', "_"));
+            statements.push(format!(
+                "let {variable} = gpui_base::motion::transition((gpui::ElementId::Name(gpui::SharedString::from({channel_key})), {css:?}), if {is_hovered} {{ {to_value} }} else {{ {from_value} }}, {policy}, _window, _cx);",
+                css = property.css_name(),
+                policy = kit_transition_policy(transition),
+            ));
+            setters.push(setter.replace("{}", &variable));
+            if matches!(from, AnimatedValue::Color(_)) {
+                self.used_motion_color = true;
+            }
+            border_color |= is_border_color;
+            animated.push(property);
+        }
+        if setters.is_empty() {
+            return None;
+        }
+        self.used_motion = true;
+        let state = format!("{base}_hovered");
+        let mut preamble = vec![
+            format!(
+                "let {state} = _window.use_keyed_state(gpui::ElementId::Name(gpui::SharedString::from({state_key})), _cx, |_, _| false);"
+            ),
+            format!("let {is_hovered} = *{state}.read(_cx);"),
+        ];
+        preamble.extend(statements);
+        self.element_preamble.extend(preamble);
+        setters.push(format!(
+            ".on_hover({{ let hovered = {state}.clone(); move |is_hovered: &bool, window: &mut gpui::Window, cx: &mut gpui::App| {{ hovered.update(cx, |value, _| *value = *is_hovered); window.refresh(); }} }})"
+        ));
+        let mut planned = plan_within(&hover_style, whole, self.style_printer.features);
+        for property in animated {
+            planned.clear(property);
+        }
+        let methods = self.style_printer.methods(&planned);
+        let refinement = (!methods.is_empty())
+            .then(|| format!(".hover(|this| {})", refinement_closure_body(&methods)));
+        // The setters follow the base styles, so the animated values win.
+        Some(Some(
+            refinement
+                .into_iter()
+                .chain(setters)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ))
     }
 
     /// A state variant from the typed lowering: the GPUI state method with
@@ -3652,7 +3879,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                 .as_ref()
                 .and_then(|hints| hints.key.as_ref())
                 .is_some()
-            || !element_needs_generated_stateful_id(element)
+            || !(element_needs_generated_stateful_id(element)
+                || (self.options.target == GpuiTarget::Kit
+                    && element_may_transition_on_hover(element)))
         {
             return;
         }
@@ -6489,6 +6718,116 @@ fn pseudo_element_preservation_reason(
     }
 
     "this pseudo-element could not be emitted by the selected adapter".to_owned()
+}
+
+/// Whether an element may animate a `:hover` rule (GPUI Kit), which needs
+/// a stateful element for its hover listener.
+fn element_may_transition_on_hover(element: &RenderElement) -> bool {
+    element
+        .styles
+        .iter()
+        .any(|style| style.property.as_str().starts_with("transition"))
+        && element.style_variants.iter().any(|variant| {
+            variant.conditions == [RenderStyleCondition::PseudoClass("hover".into())]
+        })
+}
+
+fn element_has_hover_action(element: &RenderElement) -> bool {
+    element.actions.iter().any(|action| {
+        matches!(
+            action.event.as_str(),
+            "mouseenter" | "mouseover" | "mouseleave"
+        )
+    })
+}
+
+/// The builder call applying an animated value, with `{}` for it.
+fn kit_motion_setter(property: crate::computed::AnimatableProperty) -> Option<&'static str> {
+    use crate::computed::AnimatableProperty as P;
+    Some(match property {
+        P::Opacity => ".opacity({})",
+        P::Color => ".text_color({}.0)",
+        P::BackgroundColor => ".bg({}.0)",
+        P::BorderTopColor | P::BorderRightColor | P::BorderBottomColor | P::BorderLeftColor => {
+            ".border_color({}.0)"
+        }
+        P::BorderTopWidth => ".border_t({})",
+        P::BorderRightWidth => ".border_r({})",
+        P::BorderBottomWidth => ".border_b({})",
+        P::BorderLeftWidth => ".border_l({})",
+        P::BorderTopLeftRadius => ".rounded_tl({})",
+        P::BorderTopRightRadius => ".rounded_tr({})",
+        P::BorderBottomRightRadius => ".rounded_br({})",
+        P::BorderBottomLeftRadius => ".rounded_bl({})",
+        P::Width => ".w({})",
+        P::Height => ".h({})",
+        P::MinWidth => ".min_w({})",
+        P::MinHeight => ".min_h({})",
+        P::MaxWidth => ".max_w({})",
+        P::MaxHeight => ".max_h({})",
+        P::Top => ".top({})",
+        P::Right => ".right({})",
+        P::Bottom => ".bottom({})",
+        P::Left => ".left({})",
+        P::MarginTop => ".mt({})",
+        P::MarginRight => ".mr({})",
+        P::MarginBottom => ".mb({})",
+        P::MarginLeft => ".ml({})",
+        P::PaddingTop => ".pt({})",
+        P::PaddingRight => ".pr({})",
+        P::PaddingBottom => ".pb({})",
+        P::PaddingLeft => ".pl({})",
+        P::RowGap => ".gap_y({})",
+        P::ColumnGap => ".gap_x({})",
+        P::FontSize => ".text_size({})",
+        P::FlexGrow => ".map(|mut this| { this.style().flex_grow = Some({}); this })",
+        P::FlexShrink => ".map(|mut this| { this.style().flex_shrink = Some({}); this })",
+        P::Translate | P::LetterSpacing | P::TextDecorationColor => return None,
+    })
+}
+
+/// A `gpui_base::motion::Transition` for a CSS transition.
+fn kit_transition_policy(transition: &crate::motion::Transition) -> String {
+    use crate::motion::{Easing, StepPosition};
+    let seconds = |ms: f32| {
+        format!(
+            "std::time::Duration::from_secs_f32({}_f32)",
+            format_float(ms.abs() / 1000.0)
+        )
+    };
+    let easing = match transition.easing {
+        Easing::Linear => "gpui_base::motion::Easing::Linear".to_owned(),
+        Easing::CubicBezier(x1, y1, x2, y2) => format!(
+            "gpui_base::motion::Easing::cubic_bezier({}_f32, {}_f32, {}_f32, {}_f32).unwrap_or(gpui_base::motion::Easing::Linear)",
+            format_float(x1),
+            format_float(y1),
+            format_float(x2),
+            format_float(y2)
+        ),
+        Easing::Steps(count, position) => format!(
+            "gpui_base::motion::Easing::steps({count}, gpui_base::motion::StepPosition::{}).unwrap_or(gpui_base::motion::Easing::Linear)",
+            match position {
+                StepPosition::JumpStart => "JumpStart",
+                StepPosition::JumpEnd => "JumpEnd",
+                StepPosition::JumpNone => "JumpNone",
+                StepPosition::JumpBoth => "JumpBoth",
+            }
+        ),
+    };
+    let delay = if transition.delay_ms > 0.0 {
+        format!(".delay({})", seconds(transition.delay_ms))
+    } else if transition.delay_ms < 0.0 {
+        format!(
+            ".delay(gpui_base::motion::SignedDuration::Negative({}))",
+            seconds(transition.delay_ms)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "gpui_base::motion::Transition::new({}).easing({easing}){delay}",
+        seconds(transition.duration_ms)
+    )
 }
 
 /// The body of a `StyleRefinement` closure applying printed methods. Field

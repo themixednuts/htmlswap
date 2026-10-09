@@ -2435,6 +2435,7 @@ dependencies = [
 name = "htmlswap-gpui-kit-smoke"
 version = "0.1.0"
 dependencies = [
+ "gpui-base",
  "gpui-component",
  "gpui-pre",
  "htmlswap",
