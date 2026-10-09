@@ -37,7 +37,7 @@ pub use style::{
     LineHeight, Overflow, Position, RepeatCount, Sides, Size, StyleContext, TextAlign,
     TextOverflow, TextWrap, Track, TrackBreadth, TrackSize, Unsupported, Visibility, WhiteSpace,
 };
-pub use values::{LengthAuto, LengthPercentage, ValueContext};
+pub use values::{Bases, Length, LengthAuto, LengthPercentage, ValueContext};
 
 /// A color scheme, as used by `color-scheme`, `light-dark()`, system colors
 /// and `prefers-color-scheme`.
@@ -599,11 +599,25 @@ pub struct ComputedScope {
     preferred: ColorScheme,
     scheme: ColorScheme,
     color: Option<Rgba>,
-    font_size: f32,
-    root_font_size: f32,
-    viewport: (f32, f32),
+    font_size: Length,
+    root_font_size: Length,
+    rem: RemBasis,
+    viewport: Option<(f32, f32)>,
     text_transform: TextTransform,
     font_features: FontFeatures,
+}
+
+/// What `rem` refers to.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum RemBasis {
+    /// The document root's computed font size, which a renderer that does
+    /// not own the window's rem size uses (a canvas inside another app).
+    #[default]
+    Document,
+    /// The window's rem size, which the app sets to the document root's
+    /// font size (an app that owns its window). Absolute font-size keywords
+    /// then scale from that size rather than the user's preferred one.
+    Window,
 }
 
 impl Default for ComputedScope {
@@ -622,18 +636,43 @@ impl ComputedScope {
             preferred: environment.color_scheme,
             scheme: ColorScheme::Light,
             color: None,
-            font_size: 16.0,
-            root_font_size: 16.0,
-            viewport: (environment.width, environment.height),
+            // `medium`, the user's preferred size: the window's rem size.
+            font_size: Length::rem(1.0),
+            root_font_size: Length::rem(1.0),
+            rem: RemBasis::Document,
+            viewport: Some((environment.width, environment.height)),
             text_transform: TextTransform::None,
             font_features: FontFeatures::default(),
         }
     }
 
-    /// The computed `font-size` in pixels.
+    /// The same scope with the viewport decided at runtime, so viewport
+    /// units stay symbolic (for code that runs in windows of any size).
     #[must_use]
-    pub const fn font_size(&self) -> f32 {
+    pub const fn with_runtime_viewport(mut self) -> Self {
+        self.viewport = None;
+        self
+    }
+
+    /// The same scope with `rem` referring to a basis.
+    #[must_use]
+    pub const fn with_rem_basis(mut self, rem: RemBasis) -> Self {
+        self.rem = rem;
+        self
+    }
+
+    /// The computed `font-size`.
+    #[must_use]
+    pub const fn font_size(&self) -> Length {
         self.font_size
+    }
+
+    /// The document root's computed `font-size`, once a document root is
+    /// in scope. With [`RemBasis::Window`] the app sets the window's rem
+    /// size to it.
+    #[must_use]
+    pub const fn root_font_size(&self) -> Length {
+        self.root_font_size
     }
 
     /// The inherited `text-transform`.
@@ -653,9 +692,11 @@ impl ComputedScope {
     pub const fn values(&self) -> ValueContext {
         ValueContext {
             font_size: self.font_size,
-            root_font_size: self.root_font_size,
-            viewport_width: self.viewport.0,
-            viewport_height: self.viewport.1,
+            root_font_size: match self.rem {
+                RemBasis::Document => self.root_font_size,
+                RemBasis::Window => Length::rem(1.0),
+            },
+            viewport: self.viewport,
         }
     }
 
@@ -710,10 +751,12 @@ impl ComputedScope {
         self.custom.fingerprint.hash(&mut hasher);
         self.scheme.hash(&mut hasher);
         self.color.hash(&mut hasher);
-        self.font_size.to_bits().hash(&mut hasher);
-        self.root_font_size.to_bits().hash(&mut hasher);
-        self.viewport.0.to_bits().hash(&mut hasher);
-        self.viewport.1.to_bits().hash(&mut hasher);
+        self.font_size.bits().hash(&mut hasher);
+        self.root_font_size.bits().hash(&mut hasher);
+        self.rem.hash(&mut hasher);
+        self.viewport
+            .map(|(width, height)| (width.to_bits(), height.to_bits()))
+            .hash(&mut hasher);
         self.text_transform.hash(&mut hasher);
         self.font_features.hash(&mut hasher);
         hasher.finish()
@@ -750,6 +793,7 @@ impl ComputedScope {
             color: self.color,
             font_size: self.font_size,
             root_font_size: self.root_font_size,
+            rem: self.rem,
             viewport: self.viewport,
             text_transform: self.text_transform,
             font_features: FontFeatures::default(),

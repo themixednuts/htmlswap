@@ -7,7 +7,7 @@ use lightningcss::media_query::{
 use lightningcss::stylesheet::ParserOptions;
 
 use super::ColorScheme;
-use super::values::{ValueContext, length};
+use super::values::{Length, ValueContext, length};
 
 /// What media queries are evaluated against.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -162,14 +162,15 @@ impl MediaEnvironment {
 
     /// A query value for a numeric feature.
     fn value(&self, id: MediaFeatureId, value: &MediaFeatureValue<'_>) -> Option<f32> {
+        // Relative units in media queries refer to the initial font size,
+        // the environment's rem size.
         let context = ValueContext {
-            font_size: self.font_size,
-            root_font_size: self.font_size,
-            viewport_width: self.width,
-            viewport_height: self.height,
+            font_size: Length::px(self.font_size),
+            root_font_size: Length::px(self.font_size),
+            viewport: Some((self.width, self.height)),
         };
         match (id, value) {
-            (_, MediaFeatureValue::Length(value)) => length(value, &context),
+            (_, MediaFeatureValue::Length(value)) => length(value, &context)?.as_px(),
             (_, MediaFeatureValue::Ratio(ratio)) => (ratio.1 != 0.0).then(|| ratio.0 / ratio.1),
             (_, MediaFeatureValue::Number(number)) => Some(*number),
             (_, MediaFeatureValue::Integer(integer)) => Some(*integer as f32),

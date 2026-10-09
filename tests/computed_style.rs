@@ -104,8 +104,9 @@ fn custom_properties_light_dark_and_current_color_cascade() {
         "currentColor"
     );
     assert_eq!(card.border_style.left, Some(BorderStyle::Solid));
-    assert_eq!(card.padding.top, Some(LengthPercentage::px(8.0)));
-    assert_eq!(card.padding.right, Some(LengthPercentage::px(16.0)));
+    // With no document root, `rem` stays the window's rem size.
+    assert_eq!(card.padding.top, Some(LengthPercentage::rem(0.5)));
+    assert_eq!(card.padding.right, Some(LengthPercentage::rem(1.0)));
     assert!(card.background_color.is_some_and(|color| color.b > color.r));
 
     let (title, ..) = computed(&plan, "title", &dark);
@@ -137,17 +138,21 @@ fn lengths_resolve_units_and_math() {
     );
     let (style, scope, unsupported) = computed(&plan, "box", &MediaEnvironment::default());
     assert!(unsupported.is_empty(), "{unsupported:?}");
-    // 1.5rem of the 16px root, then `larger` (×1.2).
+    // 1.5rem, then `larger` (×1.2). With no document root, rem stays the
+    // window's rem size.
     assert!(
-        (scope.font_size() - 28.8).abs() < 1e-3,
-        "{}",
+        scope
+            .font_size()
+            .as_rem()
+            .is_some_and(|rem| close(rem, 1.8)),
+        "{:?}",
         scope.font_size()
     );
     assert_eq!(style.font_size, Some(scope.font_size()));
     let Some(Size::Length(width)) = style.width else {
         panic!("width: {:?}", style.width);
     };
-    assert!((width.px + 57.6).abs() < 1e-3 && (width.fraction - 1.0).abs() < 1e-6);
+    assert!(close(width.rem, -3.6) && close(width.fraction, 1.0) && width.px == 0.0);
     assert_eq!(
         style.height,
         Some(Size::Length(LengthPercentage::px(384.0)))
@@ -159,9 +164,11 @@ fn lengths_resolve_units_and_math() {
     assert_eq!(style.max_width, Some(Size::None));
     assert_eq!(style.margin.top, Some(LengthAuto::Auto));
     assert!(
-        matches!(style.margin.right, Some(LengthAuto::Length(margin)) if close(margin.px, 28.8))
+        matches!(style.margin.right, Some(LengthAuto::Length(margin)) if close(margin.rem, 1.8))
     );
-    assert!(matches!(style.line_height, Some(LineHeight::Px(height)) if close(height, 43.2)));
+    assert!(
+        matches!(style.line_height, Some(LineHeight::Length(height)) if close(height.rem, 2.7))
+    );
     assert_eq!(
         style.border_radius.top_left,
         Some(LengthPercentage::px(4.0))
@@ -208,7 +215,7 @@ fn shorthands_grid_and_text_are_typed() {
     assert_eq!(cell.grid_column_start, Some(GridLine::Line(2)));
     assert_eq!(cell.grid_column_end, Some(GridLine::Span(3)));
     assert_eq!(cell.font_weight, Some(700.0));
-    assert_eq!(cell.font_size, Some(14.0));
+    assert_eq!(cell.font_size, Some(LengthPercentage::px(14.0)));
     assert_eq!(cell.line_height, Some(LineHeight::Number(1.4)));
     assert_eq!(
         cell.font_family,
@@ -229,7 +236,7 @@ fn shorthands_grid_and_text_are_typed() {
     assert_eq!(cell.line_clamp, Some(Some(3)));
     assert!(
         cell.letter_spacing
-            .is_some_and(|spacing| (spacing - 1.4).abs() < 1e-4)
+            .is_some_and(|spacing| close(spacing.px, 1.4))
     );
 
     let (_, _, unsupported) = computed(&plan, "named", &environment);
@@ -242,4 +249,59 @@ fn shorthands_grid_and_text_are_typed() {
         "{unsupported:?}"
     );
     assert!(properties.contains(&"background"), "{unsupported:?}");
+}
+
+#[test]
+fn rem_and_viewport_units_follow_the_runtime_policy() {
+    use htmlswap::computed::RemBasis;
+
+    let plan = compile(
+        r#"
+        <style>
+          #box { width: 2rem; height: 10vh; min-width: max(1rem, 20px); font-size: large; }
+        </style>
+        <div id="box">Box</div>
+        "#,
+    );
+    let element = ancestry(&plan.nodes, "box").and_then(|path| path.last().copied());
+    let element = element.unwrap_or_else(|| panic!("no #box"));
+    let compute = |root: ComputedScope| {
+        let scope = root.child(declarations(element));
+        let context = scope.style_context(&root);
+        let resolved = declarations(element)
+            .filter_map(|declaration| scope.resolve(declaration).map(std::borrow::Cow::into_owned))
+            .collect::<Vec<_>>();
+        ComputedStyle::compute(&resolved, &context, |declaration, reason| {
+            panic!("{declaration:?}: {reason:?}")
+        })
+    };
+    let environment = MediaEnvironment::default();
+
+    // A document root that sets a font size makes `rem` that size.
+    let root_styles = [StyleDeclaration::new("font-size", "10px", false, None)];
+    let document = ComputedScope::root(&environment).document_root(root_styles.iter());
+    let style = compute(document.clone());
+    assert_eq!(style.width, Some(Size::Length(LengthPercentage::px(20.0))));
+    assert_eq!(style.height, Some(Size::Length(LengthPercentage::px(76.8))));
+
+    // An app that owns its window sets the window's rem size to the root's
+    // font size instead, so `rem` stays symbolic; viewport units can too.
+    let window = ComputedScope::root(&environment)
+        .with_runtime_viewport()
+        .with_rem_basis(RemBasis::Window)
+        .document_root(root_styles.iter());
+    assert_eq!(window.root_font_size(), LengthPercentage::px(10.0));
+    let style = compute(window);
+    assert_eq!(style.width, Some(Size::Length(LengthPercentage::rem(2.0))));
+    let Some(Size::Length(height)) = style.height else {
+        panic!("height: {:?}", style.height);
+    };
+    assert!(close(height.vh, 0.1) && height.uses_viewport() && height.px == 0.0);
+    // GPUI has no math functions: mixed kinds settle at the initial rem size.
+    assert_eq!(
+        style.min_width,
+        Some(Size::Length(LengthPercentage::px(20.0)))
+    );
+    // Absolute font-size keywords scale from the user's preferred size.
+    assert_eq!(style.font_size, Some(LengthPercentage::rem(1.2)));
 }

@@ -2610,6 +2610,7 @@ dependencies = [
  "arcstr",
  "clap",
  "compact_str",
+ "cssparser",
  "heck 0.5.0",
  "html5ever",
  "include_dir",

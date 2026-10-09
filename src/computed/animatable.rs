@@ -165,7 +165,6 @@ impl AnimatableProperty {
             LengthAuto::Length(length) => Some(Length(length)),
             LengthAuto::Auto => None,
         };
-        let px = |value: Option<f32>| value.map(|px| Length(LengthPercentage::px(px)));
         let color = |value: Option<Rgba>| value.map(AnimatedValue::color);
         match self {
             Self::Opacity => style.opacity.map(Number),
@@ -175,10 +174,10 @@ impl AnimatableProperty {
             Self::BorderRightColor => color(style.border_color.right),
             Self::BorderBottomColor => color(style.border_color.bottom),
             Self::BorderLeftColor => color(style.border_color.left),
-            Self::BorderTopWidth => px(style.border_width.top),
-            Self::BorderRightWidth => px(style.border_width.right),
-            Self::BorderBottomWidth => px(style.border_width.bottom),
-            Self::BorderLeftWidth => px(style.border_width.left),
+            Self::BorderTopWidth => style.border_width.top.map(Length),
+            Self::BorderRightWidth => style.border_width.right.map(Length),
+            Self::BorderBottomWidth => style.border_width.bottom.map(Length),
+            Self::BorderLeftWidth => style.border_width.left.map(Length),
             Self::BorderTopLeftRadius => style.border_radius.top_left.map(Length),
             Self::BorderTopRightRadius => style.border_radius.top_right.map(Length),
             Self::BorderBottomRightRadius => style.border_radius.bottom_right.map(Length),
@@ -204,8 +203,8 @@ impl AnimatableProperty {
             Self::RowGap => style.row_gap.map(Length),
             Self::ColumnGap => style.column_gap.map(Length),
             Self::Translate => style.translate.map(|(x, y)| AnimatedValue::Translate(x, y)),
-            Self::FontSize => px(style.font_size),
-            Self::LetterSpacing => px(style.letter_spacing),
+            Self::FontSize => style.font_size.map(Length),
+            Self::LetterSpacing => style.letter_spacing.map(Length),
             Self::FlexGrow => style.flex_grow.map(Number),
             Self::FlexShrink => style.flex_shrink.map(Number),
             Self::TextDecorationColor => color(style.text_decoration_color),
@@ -217,7 +216,12 @@ impl AnimatableProperty {
         let length = value.length();
         let number = value.number();
         let rgba = value.rgba();
-        let px = length.and_then(LengthPercentage::as_px);
+        // Values outside a property's range clamp to it (CSS Values 4 §10),
+        // which a length with runtime parts can only do once resolved.
+        let non_negative = length.map(|length| match length.as_px() {
+            Some(px) => LengthPercentage::px(px.max(0.0)),
+            None => length,
+        });
         match self {
             Self::Opacity => style.opacity = number.map(|value| value.clamp(0.0, 1.0)),
             Self::Color => style.color = rgba,
@@ -226,10 +230,10 @@ impl AnimatableProperty {
             Self::BorderRightColor => style.border_color.right = rgba,
             Self::BorderBottomColor => style.border_color.bottom = rgba,
             Self::BorderLeftColor => style.border_color.left = rgba,
-            Self::BorderTopWidth => style.border_width.top = px.map(|px| px.max(0.0)),
-            Self::BorderRightWidth => style.border_width.right = px.map(|px| px.max(0.0)),
-            Self::BorderBottomWidth => style.border_width.bottom = px.map(|px| px.max(0.0)),
-            Self::BorderLeftWidth => style.border_width.left = px.map(|px| px.max(0.0)),
+            Self::BorderTopWidth => style.border_width.top = non_negative,
+            Self::BorderRightWidth => style.border_width.right = non_negative,
+            Self::BorderBottomWidth => style.border_width.bottom = non_negative,
+            Self::BorderLeftWidth => style.border_width.left = non_negative,
             Self::BorderTopLeftRadius => style.border_radius.top_left = length,
             Self::BorderTopRightRadius => style.border_radius.top_right = length,
             Self::BorderBottomRightRadius => style.border_radius.bottom_right = length,
@@ -255,8 +259,8 @@ impl AnimatableProperty {
             Self::RowGap => style.row_gap = length,
             Self::ColumnGap => style.column_gap = length,
             Self::Translate => style.translate = value.translate(),
-            Self::FontSize => style.font_size = px.map(|px| px.max(0.0)),
-            Self::LetterSpacing => style.letter_spacing = px,
+            Self::FontSize => style.font_size = non_negative,
+            Self::LetterSpacing => style.letter_spacing = length,
             Self::FlexGrow => style.flex_grow = number.map(|value| value.max(0.0)),
             Self::FlexShrink => style.flex_shrink = number.map(|value| value.max(0.0)),
             Self::TextDecorationColor => style.text_decoration_color = rgba,
@@ -300,7 +304,7 @@ impl AnimatableProperty {
             Self::Translate => {
                 AnimatedValue::Translate(LengthPercentage::ZERO, LengthPercentage::ZERO)
             }
-            Self::FontSize => Length(LengthPercentage::px(underlying.font_size)),
+            Self::FontSize => Length(underlying.font_size),
             Self::FlexGrow => Number(0.0),
             Self::FlexShrink => Number(1.0),
             // `auto` and `none` do not interpolate.
@@ -409,7 +413,7 @@ pub struct Underlying {
     /// The inherited `color`, for `color` and `currentColor` initials.
     pub current_color: Rgba,
     /// The inherited `font-size`.
-    pub font_size: f32,
+    pub font_size: LengthPercentage,
 }
 
 #[cfg(test)]
@@ -425,7 +429,8 @@ mod tests {
             from.lerp(to, 0.5),
             Some(AnimatedValue::Length(LengthPercentage {
                 px: 50.0,
-                fraction: 0.25
+                fraction: 0.25,
+                ..LengthPercentage::ZERO
             }))
         );
     }
@@ -454,7 +459,7 @@ mod tests {
     fn every_property_round_trips_through_the_style() {
         let underlying = Underlying {
             current_color: Rgba::opaque(0x123456),
-            font_size: 16.0,
+            font_size: LengthPercentage::rem(1.0),
         };
         for property in AnimatableProperty::ALL {
             let value = property

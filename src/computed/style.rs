@@ -48,7 +48,9 @@ use lightningcss::values::length::{
     LengthPercentage as CssLengthPercentage, LengthPercentageOrAuto,
 };
 
-use super::values::{LengthAuto, LengthPercentage, ValueContext, length, length_percentage};
+use super::values::{
+    Length, LengthAuto, LengthPercentage, ValueContext, length, length_percentage,
+};
 use super::{ColorContext, DecorationLines, DecorationStyle, Rgba};
 use crate::style::StyleDeclaration;
 
@@ -197,10 +199,10 @@ pub enum BorderStyle {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoxShadow {
     pub color: Rgba,
-    pub x: f32,
-    pub y: f32,
-    pub blur: f32,
-    pub spread: f32,
+    pub x: Length,
+    pub y: Length,
+    pub blur: Length,
+    pub spread: Length,
     pub inset: bool,
 }
 
@@ -247,8 +249,8 @@ pub enum LineHeight {
     Normal,
     /// A multiple of the font size.
     Number(f32),
-    /// Lengths and percentages compute to pixels.
-    Px(f32),
+    /// Lengths and percentages compute to a length.
+    Length(Length),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,7 +293,7 @@ pub enum TextWrap {
 pub enum DecorationThickness {
     Auto,
     FromFont,
-    Px(f32),
+    Length(Length),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -427,7 +429,7 @@ pub struct ComputedStyle {
     pub opacity: Option<f32>,
     pub color: Option<Rgba>,
     pub background_color: Option<Rgba>,
-    pub border_width: Sides<Option<f32>>,
+    pub border_width: Sides<Option<Length>>,
     pub border_style: Sides<Option<BorderStyle>>,
     pub border_color: Sides<Option<Rgba>>,
     pub border_radius: Corners<Option<LengthPercentage>>,
@@ -435,12 +437,12 @@ pub struct ComputedStyle {
     pub cursor: Option<Cursor>,
     pub translate: Option<(LengthPercentage, LengthPercentage)>,
     pub font_family: Option<Vec<FontFamily>>,
-    pub font_size: Option<f32>,
+    pub font_size: Option<Length>,
     pub font_weight: Option<f32>,
     pub font_style: Option<FontStyle>,
     pub line_height: Option<LineHeight>,
-    pub letter_spacing: Option<f32>,
-    pub word_spacing: Option<f32>,
+    pub letter_spacing: Option<Length>,
+    pub word_spacing: Option<Length>,
     pub text_align: Option<TextAlign>,
     pub white_space: Option<WhiteSpace>,
     pub text_wrap: Option<TextWrap>,
@@ -458,7 +460,7 @@ pub struct ComputedStyle {
 pub struct StyleContext {
     pub values: ValueContext,
     /// The parent's computed `font-size`, which `em` in `font-size` uses.
-    pub parent_font_size: f32,
+    pub parent_font_size: Length,
     pub colors: ColorContext,
 }
 
@@ -936,7 +938,7 @@ impl ComputedStyle {
                 self.translate = Some(match value {
                     Translate::None => (LengthPercentage::ZERO, LengthPercentage::ZERO),
                     Translate::XYZ { x, y, z } => {
-                        if length(z, values).is_some_and(|z| z != 0.0) {
+                        if length(z, values).is_some_and(|z| !z.is_zero()) {
                             return Err(Unsupported::Value("3D translation is not supported"));
                         }
                         (lp(x)?, lp(y)?)
@@ -1532,11 +1534,11 @@ const fn overflow(value: OverflowKeyword) -> Overflow {
     }
 }
 
-fn border_width(value: &BorderSideWidth, context: &ValueContext) -> Result<f32, Unsupported> {
+fn border_width(value: &BorderSideWidth, context: &ValueContext) -> Result<Length, Unsupported> {
     Ok(match value {
-        BorderSideWidth::Thin => 1.0,
-        BorderSideWidth::Medium => 3.0,
-        BorderSideWidth::Thick => 5.0,
+        BorderSideWidth::Thin => Length::px(1.0),
+        BorderSideWidth::Medium => Length::px(3.0),
+        BorderSideWidth::Thick => Length::px(5.0),
         BorderSideWidth::Length(value) => {
             length(value, context).ok_or(Unsupported::Value("unresolvable length"))?
         }
@@ -1650,12 +1652,12 @@ fn font_family(value: &CssFontFamily<'_>) -> FontFamily {
     }
 }
 
-/// A computed `font-size` in pixels.
+/// A computed `font-size`.
 pub(crate) fn font_size(
     value: &FontSize,
-    parent: f32,
+    parent: Length,
     context: &ValueContext,
-) -> Result<f32, Unsupported> {
+) -> Result<Length, Unsupported> {
     Ok(match value {
         FontSize::Length(value) => {
             // `em` and percentages in font-size refer to the parent.
@@ -1665,11 +1667,12 @@ pub(crate) fn font_size(
             };
             length_percentage(value, &parent_context)
                 .ok_or(Unsupported::Value("unresolvable length"))?
-                .resolve(parent)
+                .percent_of(parent)
         }
         FontSize::Absolute(size) => {
-            // CSS Fonts 4 §2.5 scale, from a 16px `medium`.
-            16.0 * match size {
+            // CSS Fonts 4 §2.5 scale from `medium`, the user's preferred
+            // size: the window's rem size.
+            Length::rem(match size {
                 AbsoluteFontSize::XXSmall => 0.6,
                 AbsoluteFontSize::XSmall => 0.75,
                 AbsoluteFontSize::Small => 0.889,
@@ -1678,16 +1681,16 @@ pub(crate) fn font_size(
                 AbsoluteFontSize::XLarge => 1.5,
                 AbsoluteFontSize::XXLarge => 2.0,
                 AbsoluteFontSize::XXXLarge => 3.0,
-            }
+            })
         }
-        FontSize::Relative(RelativeFontSize::Larger) => parent * 1.2,
-        FontSize::Relative(RelativeFontSize::Smaller) => parent / 1.2,
+        FontSize::Relative(RelativeFontSize::Larger) => parent.scale(1.2),
+        FontSize::Relative(RelativeFontSize::Smaller) => parent.scale(1.0 / 1.2),
     })
 }
 
-fn spacing(value: &Spacing, context: &ValueContext) -> Result<f32, Unsupported> {
+fn spacing(value: &Spacing, context: &ValueContext) -> Result<Length, Unsupported> {
     match value {
-        Spacing::Normal => Ok(0.0),
+        Spacing::Normal => Ok(Length::ZERO),
         Spacing::Length(value) => {
             length(value, context).ok_or(Unsupported::Value("unresolvable length"))
         }
@@ -1720,10 +1723,10 @@ fn thickness(
         TextDecorationThickness::Auto => DecorationThickness::Auto,
         TextDecorationThickness::FromFont => DecorationThickness::FromFont,
         // Percentages refer to 1em.
-        TextDecorationThickness::LengthPercentage(value) => DecorationThickness::Px(
+        TextDecorationThickness::LengthPercentage(value) => DecorationThickness::Length(
             length_percentage(value, context)
                 .ok_or(Unsupported::Value("unresolvable length"))?
-                .resolve(context.font_size),
+                .percent_of(context.font_size),
         ),
     })
 }
@@ -1754,10 +1757,10 @@ fn line_height(value: &CssLineHeight, context: &ValueContext) -> Result<LineHeig
         CssLineHeight::Normal => LineHeight::Normal,
         CssLineHeight::Number(number) => LineHeight::Number(*number),
         // Lengths and percentages compute to an absolute length.
-        CssLineHeight::Length(value) => LineHeight::Px(
+        CssLineHeight::Length(value) => LineHeight::Length(
             length_percentage(value, context)
                 .ok_or(Unsupported::Value("unresolvable length"))?
-                .resolve(context.font_size),
+                .percent_of(context.font_size),
         ),
     })
 }
@@ -1766,9 +1769,9 @@ fn line_height(value: &CssLineHeight, context: &ValueContext) -> Result<LineHeig
 pub(crate) fn font_size_of(
     property: &str,
     value: &str,
-    parent: f32,
+    parent: Length,
     context: &ValueContext,
-) -> Option<f32> {
+) -> Option<Length> {
     let parsed =
         Property::parse_string(PropertyId::from(property), value, ParserOptions::default()).ok()?;
     match parsed {
