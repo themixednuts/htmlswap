@@ -317,8 +317,15 @@ fn gpui_adapter_maps_images_and_supported_style_properties() {
     assert!(code.contains(".pb(gpui::px(4.0))"));
     assert!(code.contains(".pl(gpui::px(5.0))"));
     assert!(code.contains(".w(gpui::relative(0.5))"));
-    assert!(code.contains(".min_w(gpui::px(10.0))"));
-    assert!(code.contains(".max_h(gpui::rems(2.0))"));
+    // `content-box`: GPUI sizes are border-box, so padding and borders are
+    // added (3px + 5px + two 1px borders across, 2px + 4px + 2px down).
+    assert!(code.contains(".min_w(gpui::px(20.0))"), "{code}");
+    assert!(
+        code.contains(".max_h(gpui::px(8.0) + htmlswap_rem_size * 2.0_f32)"),
+        "{code}"
+    );
+    assert!(code.contains("let htmlswap_rem_size = _window.rem_size();"));
+    assert!(code.contains("preserved CSS: width: 50%"), "{code}");
     assert!(code.contains(".border(gpui::px(1.0))"));
     assert!(code.contains(".border_color(gpui::rgba(0x336699CC))"));
     assert!(code.contains(".rounded(gpui::px(4.0))"));
@@ -405,8 +412,9 @@ fn gpui_adapter_maps_common_layout_css_properties() {
     assert!(code.contains(".inset(gpui::px(0.0))"));
     assert!(code.contains(".top(gpui::px(9.0))"));
     assert!(code.contains(".left(gpui::relative(0.5))"));
-    assert!(code.contains(".w_full()"));
-    assert!(code.contains(".h_full()"));
+    assert!(code.contains(".w(htmlswap_viewport.width)"), "{code}");
+    assert!(code.contains(".h(htmlswap_viewport.height)"), "{code}");
+    assert!(code.contains("let htmlswap_viewport = _window.viewport_size();"));
     assert!(code.contains(".bg(gpui::rgb(0x16181C))"));
     assert!(code.contains(".border_b(gpui::px(1.0))"));
     assert!(code.contains(".border_color(gpui::rgb(0x2C313A))"));
@@ -450,7 +458,10 @@ fn gpui_adapter_makes_flex_direction_a_flex_container() {
 
     syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
 
-    assert!(compact_code.contains(".flex().flex_col()"), "{code}");
+    // Without `display: flex` browsers ignore `flex-direction`; GPUI's
+    // default block layout stacks the children as they do.
+    assert!(compact_code.contains(".flex_col()"), "{code}");
+    assert!(!compact_code.contains(".flex()"), "{code}");
     assert!(adapter_context.diagnostics().is_empty());
 }
 
@@ -499,12 +510,13 @@ fn gpui_adapter_preserves_html_body_root_layout_styles() {
 
     assert!(
         compact_code
-            .contains("gpui::div().w_full().h_full().flex().items_center().justify_center()")
+            .contains("gpui::div().w(htmlswap_viewport.width).h(htmlswap_viewport.height).flex().items_center().justify_center()"),
+        "{code}"
     );
     assert!(code.contains(".m(gpui::px(0.0))"));
     assert!(code.contains(".bg(gpui::rgb(0x1B1E23))"));
-    assert!(compact_code.matches(".w_full()").count() >= 2);
-    assert!(compact_code.matches(".h_full()").count() >= 2);
+    // The body is sized to the viewport, `.app` to its parent.
+    assert!(compact_code.contains("gpui::div().w_full().h_full().child(\"Editor\")"));
     assert!(compact_code.contains("\"Editor\""));
     assert!(adapter_context.diagnostics().is_empty());
 }
@@ -1532,4 +1544,45 @@ fn gpui_adapter_exposes_html_import_api() {
             .html()
             .contains("Imported")
     );
+}
+
+#[test]
+fn gpui_adapter_emits_runtime_lengths_from_the_typed_lowering() {
+    let compiled = Compiler::new().compile_fragment(
+        r#"<p style="box-sizing:content-box; max-height:calc(2rem + 8px); min-width:10vmin; font-size:1.25rem; margin:0 0.5rem; box-shadow:0 1px 2px #0004; flex:2 0 auto; aspect-ratio:2;">Units</p>"#,
+        &CompileAssets::new(),
+    );
+    assert!(compiled.diagnostics.is_empty());
+
+    let mut adapter_context = AdapterContext::new();
+    let output = GpuiAdapter::default()
+        .adapt(&compiled.value, &mut adapter_context)
+        .expect("GPUI adapter should emit code");
+    let code = output.code();
+    syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
+
+    for expected in [
+        "let htmlswap_rem_size = _window.rem_size();",
+        "let htmlswap_viewport = _window.viewport_size();",
+        ".max_h(gpui::px(8.0) + htmlswap_rem_size * 2.0_f32)",
+        ".min_w((if htmlswap_viewport.width < htmlswap_viewport.height { htmlswap_viewport.width } else { htmlswap_viewport.height }) * 0.1_f32",
+        ".text_size(gpui::rems(1.25))",
+        ".mt(gpui::px(0.0))",
+        ".mr(gpui::rems(0.5))",
+        "offset: gpui::point(gpui::px(0.0), gpui::px(1.0))",
+        "this.style().flex_grow = Some(2.0)",
+        ".flex_shrink_0()",
+        ".flex_basis(gpui::auto())",
+        "this.style().aspect_ratio = Some(2.0)",
+    ] {
+        let compact = |text: &str| text.split_whitespace().collect::<String>();
+        assert!(
+            compact(code).contains(&compact(expected)),
+            "missing {expected}:\n{code}"
+        );
+    }
+    // gpui 0.2 has no inset shadows, so the field is not printed.
+    assert!(!code.contains("inset:"), "{code}");
+    assert!(!code.contains("unmapped CSS"), "{code}");
+    assert!(adapter_context.diagnostics().is_empty());
 }

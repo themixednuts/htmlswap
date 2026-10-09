@@ -24,6 +24,7 @@ use lightningcss::values::color::{CssColor, RGBA};
 use crate::style::{StyleDeclaration, StyleProperty};
 
 mod animatable;
+pub mod gpui;
 mod media;
 mod style;
 mod values;

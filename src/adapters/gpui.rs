@@ -16,7 +16,10 @@ use crate::adapter::{
     TargetDependency,
 };
 use crate::adapters::gpui_reverse::{GpuiImportMode, import_gpui_target};
+use crate::adapters::gpui_style::StylePrinter;
 use crate::compiler::CompiledFragment;
+use crate::computed::gpui::plan_within;
+use crate::computed::{ComputedScope, ComputedStyle, MediaEnvironment, Unsupported};
 use crate::diagnostics::Diagnostic;
 use crate::emit::render_html_fragment;
 use crate::expr::{Expr, ExprLiteral, TemplateSegment, TemplateString};
@@ -971,6 +974,9 @@ struct RenderScope {
     loop_indices: Vec<String>,
     text_transform: TextTransform,
     inside_title_bar_drag_area: bool,
+    /// The computed values an element's declarations resolve against: its
+    /// parent's.
+    computed: ComputedScope,
 }
 
 impl RenderScope {
@@ -992,6 +998,12 @@ impl RenderScope {
         next
     }
 
+    fn with_computed(&self, computed: ComputedScope) -> Self {
+        let mut next = self.clone();
+        next.computed = computed;
+        next
+    }
+
     fn inside_title_bar_drag_area(&self) -> Self {
         let mut next = self.clone();
         next.inside_title_bar_drag_area = true;
@@ -1003,9 +1015,40 @@ impl RenderScope {
     }
 }
 
+/// The scope above the document: initial values, with the viewport left to
+/// the window the generated code runs in.
+fn initial_scope() -> ComputedScope {
+    ComputedScope::root(&MediaEnvironment::default()).with_runtime_viewport()
+}
+
+/// The document root's scope, whose font size `rem` refers to.
+fn document_scope(plan: &RenderPlan) -> ComputedScope {
+    initial_scope().document_root(plan.root.styles.iter())
+}
+
+/// An element's whole computed style, which decides how its sizes become
+/// GPUI's border-box sizes.
+fn whole_computed_style(
+    declarations: &[StyleDeclaration],
+    computed: &ComputedScope,
+    parent: &ComputedScope,
+) -> ComputedStyle {
+    let resolved = declarations
+        .iter()
+        .filter_map(|declaration| {
+            computed
+                .resolve(declaration)
+                .map(std::borrow::Cow::into_owned)
+        })
+        .collect::<Vec<_>>();
+    ComputedStyle::compute(&resolved, &computed.style_context(parent), |_, _| {})
+}
+
 fn scope_for_element(element: &RenderElement, scope: &RenderScope) -> RenderScope {
     let text_transform = text_transform_for_element(element, scope);
-    let mut next = scope.with_text_transform(text_transform);
+    let mut next = scope
+        .with_text_transform(text_transform)
+        .with_computed(scope.computed.child(element.styles.iter()));
     if let Some(control_flow) = &element.control_flow
         && control_flow.kind == RenderControlFlowKind::For
         && let Some(binding) = &control_flow.binding
@@ -1501,6 +1544,7 @@ struct GpuiCodegen<'a, 'layers, 'cx> {
     sources: Option<&'a SourceMap>,
     source_markers: Vec<GeneratedSourceMarker>,
     next_source_marker: usize,
+    style_printer: StylePrinter,
 }
 
 impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
@@ -1535,6 +1579,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             sources: None,
             source_markers: Vec::new(),
             next_source_marker: 0,
+            style_printer: StylePrinter::default(),
         }
     }
 
@@ -1595,7 +1640,15 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         }
 
         self.write_theme_bindings(&mut render_body);
-        render_body.push_str(&self.render_plan_expression(&fragment.plan, 2));
+        let expression = self.render_plan_expression(&fragment.plan, 2);
+        let prelude = self.style_printer.prelude("_window");
+        for line in &prelude {
+            writeln!(render_body, "{}{line}", indent(2)).expect("writing to String cannot fail");
+        }
+        if !prelude.is_empty() {
+            render_body.push('\n');
+        }
+        render_body.push_str(&expression);
         render_body.push('\n');
 
         let mut output = String::new();
@@ -2144,7 +2197,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
     }
 
     fn render_plan_expression(&mut self, plan: &RenderPlan, depth: usize) -> String {
-        let scope = RenderScope::default();
+        let scope = RenderScope::default().with_computed(document_scope(plan));
         if !plan.root.is_empty() {
             return self.render_root_expression(plan, depth, &scope);
         }
@@ -2266,7 +2319,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         self.push_title_bar_interaction_methods(&mut expression, element, &spec, scope);
         self.push_action_methods(&mut expression, element, &mut comments, &spec, scope);
         self.push_pseudo_element_comments(element, &mut comments, &spec);
-        let child_scope = scope.with_text_transform(text_transform_for_element(element, scope));
+        let child_scope = scope
+            .with_text_transform(text_transform_for_element(element, scope))
+            .with_computed(scope.computed.child(element.styles.iter()));
 
         match spec.children {
             ChildEmission::Children => {
@@ -2732,6 +2787,8 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             return;
         }
 
+        let computed = scope.computed.child(element.styles.iter());
+        let whole = whole_computed_style(&element.styles, &computed, &scope.computed);
         for style in &element.styles {
             if spec.children == ChildEmission::MaterialIcon
                 && style_is_consumed_by_material_icon(style)
@@ -2770,6 +2827,23 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                 }
                 let method = self.mark_source(method, style.span, SourceMappingKind::Style);
                 push_method(expression, 0, &method);
+                continue;
+            }
+            if !self.uses_theme_binding(style)
+                && let Some((methods, approximate)) =
+                    self.typed_style_methods(style, &computed, &scope.computed, &whole)
+            {
+                if approximate {
+                    comments.push(preserved_style_comment(
+                        "preserved CSS",
+                        style,
+                        element.span,
+                    ));
+                }
+                for method in methods {
+                    let method = self.mark_source(method, style.span, SourceMappingKind::Style);
+                    push_method(expression, 0, &method);
+                }
                 continue;
             }
             if let Some(method) = self.gpui_style_method(style) {
@@ -2818,13 +2892,72 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         self.push_dynamic_style_methods(expression, element, comments, scope);
     }
 
+    /// Whether a declaration reads a theme token this component binds to the
+    /// active theme, which the typed lowering would resolve to a literal.
+    fn uses_theme_binding(&self, style: &StyleDeclaration) -> bool {
+        !self.theme_bindings.is_empty()
+            && (matches!(style.value, StyleValue::Token(_))
+                || style.value.as_str().contains("var("))
+    }
+
+    /// The builder calls for one declaration from the typed lowering, and
+    /// whether GPUI draws it only approximately. `None` when the typed model
+    /// does not cover the declaration or GPUI cannot draw any of it, so the
+    /// caller can fall back.
+    fn typed_style_methods(
+        &mut self,
+        style: &StyleDeclaration,
+        computed: &ComputedScope,
+        parent: &ComputedScope,
+        whole: &ComputedStyle,
+    ) -> Option<(Vec<String>, bool)> {
+        let resolved = computed.resolve(style)?;
+        let context = computed.style_context(parent);
+        let mut unsupported = false;
+        let declaration = ComputedStyle::compute(
+            std::slice::from_ref(resolved.as_ref()),
+            &context,
+            |_, _: Unsupported| unsupported = true,
+        );
+        if unsupported {
+            return None;
+        }
+        let planned = plan_within(&declaration, whole, self.style_printer.features);
+        let methods = self.style_printer.methods(&planned);
+        if methods.is_empty() && !planned.limits.is_empty() {
+            return None;
+        }
+        let approximate = !planned.approximations.is_empty() || !planned.limits.is_empty();
+        Some((methods, approximate))
+    }
+
     fn push_root_style_methods(
         &mut self,
         expression: &mut String,
         plan: &RenderPlan,
         comments: &mut Vec<MappedComment>,
     ) {
+        let parent = initial_scope();
+        let computed = document_scope(plan);
+        let whole = whole_computed_style(&plan.root.styles, &computed, &parent);
         for style in &plan.root.styles {
+            if !self.uses_theme_binding(style)
+                && let Some((methods, approximate)) =
+                    self.typed_style_methods(style, &computed, &parent, &whole)
+            {
+                if approximate {
+                    comments.push(preserved_style_comment(
+                        "preserved root CSS",
+                        style,
+                        plan.root.span,
+                    ));
+                }
+                for method in methods {
+                    let method = self.mark_source(method, style.span, SourceMappingKind::Style);
+                    push_method(expression, 0, &method);
+                }
+                continue;
+            }
             if let Some(method) = self.gpui_style_method(style) {
                 if style_should_preserve_original_css(style) {
                     comments.push(preserved_style_comment(
