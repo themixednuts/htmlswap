@@ -1054,8 +1054,9 @@ fn gpui_adapter_emits_supported_dynamic_style_variants() {
 
     assert!(
         code.contains(
-            ".hover(|this| this.text_color(gpui::rgb(0xFF0000)).bg(gpui::rgb(0x0000FF)))"
-        )
+            ".hover(|this| this.bg(gpui::rgb(0x0000FF)).text_color(gpui::rgb(0xFF0000)))"
+        ),
+        "{code}"
     );
     assert!(code.contains(".id(\"htmlswap_interactive_"));
     assert!(
@@ -1584,5 +1585,45 @@ fn gpui_adapter_emits_runtime_lengths_from_the_typed_lowering() {
     // gpui 0.2 has no inset shadows, so the field is not printed.
     assert!(!code.contains("inset:"), "{code}");
     assert!(!code.contains("unmapped CSS"), "{code}");
+    assert!(adapter_context.diagnostics().is_empty());
+}
+
+#[test]
+fn gpui_adapter_emits_ancestor_states_as_gpui_groups() {
+    let assets = CompileAssets::new().with_stylesheet(
+        Some("app.css".to_owned()),
+        r#"
+            .card:hover .title { color: #ff0000; aspect-ratio: 2; }
+            .card:active .title { opacity: 0.5; }
+            .card:focus .title { color: #0000ff; }
+            .title:hover { color: #00ff00; }
+        "#,
+    );
+    let compiled = Compiler::new().compile_fragment(
+        r#"<div class="card"><span class="title">Title</span></div>"#,
+        &assets,
+    );
+    assert!(compiled.diagnostics.is_empty());
+
+    let mut adapter_context = AdapterContext::new();
+    let output = GpuiAdapter::default()
+        .adapt(&compiled.value, &mut adapter_context)
+        .expect("GPUI adapter should emit code");
+    let code = output.code();
+    syn::parse_file(code).expect("GPUI adapter should emit syntactically valid Rust");
+    let compact = code.split_whitespace().collect::<String>();
+
+    for expected in [
+        r#".group("htmlswap-group-0")"#,
+        // Refinements have no `map`, so field assignments become statements.
+        r#".group_hover("htmlswap-group-0",|this|{letmutthis=this.text_color(gpui::rgb(0xFF0000));this.style().aspect_ratio=Some(2.0);this})"#,
+        r#".group_active("htmlswap-group-0",|this|this.opacity(0.5))"#,
+        r#".in_focus(|this|this.text_color(gpui::rgb(0x0000FF)))"#,
+        r#".hover(|this|this.text_color(gpui::rgb(0x00FF00)))"#,
+    ] {
+        assert!(compact.contains(expected), "missing {expected}:\n{code}");
+    }
+    // `in_focus` matches any focused ancestor, not the card alone.
+    assert!(code.contains("preserved CSS: conditional CSS"), "{code}");
     assert!(adapter_context.diagnostics().is_empty());
 }

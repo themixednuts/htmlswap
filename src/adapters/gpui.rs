@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 use compact_str::CompactString;
@@ -1545,6 +1545,14 @@ struct GpuiCodegen<'a, 'layers, 'cx> {
     source_markers: Vec<GeneratedSourceMarker>,
     next_source_marker: usize,
     style_printer: StylePrinter,
+    /// GPUI group names for the elements a state selector on a descendant
+    /// refers to (`.card:hover .title`), by element address.
+    group_names: HashMap<usize, String>,
+    /// The group each descendant's state variant refers to, by the
+    /// descendant's address and the ancestor's distance.
+    group_targets: HashMap<(usize, u16), usize>,
+    /// Elements whose `.group(..)` has been printed.
+    emitted_groups: HashSet<usize>,
 }
 
 impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
@@ -1580,6 +1588,9 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             source_markers: Vec::new(),
             next_source_marker: 0,
             style_printer: StylePrinter::default(),
+            group_names: HashMap::new(),
+            group_targets: HashMap::new(),
+            emitted_groups: HashSet::new(),
         }
     }
 
@@ -1591,6 +1602,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         self.theme_plan = fragment.plan.theme.clone();
         self.theme_bindings = theme_bindings_for_plan(&fragment.plan, self.options.theme);
         self.used_gpui_component_theme = !self.theme_bindings.is_empty();
+        self.plan_groups(&fragment.plan);
         let body = self.render_component_body(fragment);
         let dependencies = self.dependencies();
         let mut output = String::new();
@@ -2305,6 +2317,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             push_method(&mut expression, 0, ".size_full()");
         }
         self.push_attribute_methods(&mut expression, element, &mut comments, &spec, scope);
+        self.push_group_method(&mut expression, element, &spec);
         let has_runtime_id = element_id(element).is_some()
             || self.push_debug_layout_id_if_needed(&mut expression, element, &spec, scope);
         self.push_generated_stateful_id_if_needed(
@@ -2485,6 +2498,7 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
             SourceMappingKind::Element,
         );
         self.push_attribute_methods(&mut expression, element, &mut comments, &spec, scope);
+        self.push_group_method(&mut expression, element, &spec);
         let has_runtime_id = element_id(element).is_some()
             || self.push_debug_layout_id_if_needed(&mut expression, element, &spec, scope);
         self.push_generated_stateful_id_if_needed(
@@ -2876,6 +2890,18 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
                     variant.span.or(element.span),
                     SourceMappingKind::Style,
                 ));
+            } else if let Some((method, approximate)) =
+                self.typed_variant_method(element, variant, &computed, &scope.computed, &whole)
+            {
+                if approximate {
+                    comments.push(MappedComment::new(
+                        format!("preserved CSS: {}", format_style_variant(variant)),
+                        variant.span.or(element.span),
+                        SourceMappingKind::Style,
+                    ));
+                }
+                let method = self.mark_source(method, variant.span, SourceMappingKind::Style);
+                push_method(expression, 0, &method);
             } else if let Some(method) = self.gpui_style_variant_method(variant) {
                 let method = self.mark_source(method, variant.span, SourceMappingKind::Style);
                 push_method(expression, 0, &method);
@@ -2890,6 +2916,192 @@ impl<'a, 'layers, 'cx> GpuiCodegen<'a, 'layers, 'cx> {
         }
 
         self.push_dynamic_style_methods(expression, element, comments, scope);
+    }
+
+    /// Name a GPUI group for each element a descendant's state selector
+    /// refers to.
+    fn plan_groups(&mut self, plan: &RenderPlan) {
+        fn visit(
+            node: &RenderNode,
+            ancestors: &mut Vec<usize>,
+            names: &mut HashMap<usize, String>,
+            targets: &mut HashMap<(usize, u16), usize>,
+        ) {
+            let RenderNode::Element(element) = node else {
+                return;
+            };
+            let address = std::ptr::from_ref::<RenderElement>(element) as usize;
+            for variant in &element.style_variants {
+                for condition in &variant.conditions {
+                    if let RenderStyleCondition::ElementState {
+                        pseudo,
+                        ancestor,
+                        negated: false,
+                    } = condition
+                        && matches!(pseudo.as_str(), "hover" | "active")
+                        && let Some(index) = ancestors.len().checked_sub(usize::from(*ancestor))
+                    {
+                        let target = ancestors[index];
+                        let next = names.len();
+                        names
+                            .entry(target)
+                            .or_insert_with(|| format!("htmlswap-group-{next}"));
+                        targets.insert((address, *ancestor), target);
+                    }
+                }
+            }
+            ancestors.push(address);
+            for child in &element.children {
+                visit(child, ancestors, names, targets);
+            }
+            ancestors.pop();
+        }
+        self.group_names.clear();
+        self.group_targets.clear();
+        self.emitted_groups.clear();
+        let mut ancestors = Vec::new();
+        for node in &plan.nodes {
+            visit(
+                node,
+                &mut ancestors,
+                &mut self.group_names,
+                &mut self.group_targets,
+            );
+        }
+    }
+
+    fn push_group_method(
+        &mut self,
+        expression: &mut String,
+        element: &RenderElement,
+        spec: &GpuiElementSpec,
+    ) {
+        let address = std::ptr::from_ref::<RenderElement>(element) as usize;
+        let Some(name) = self.group_names.get(&address) else {
+            return;
+        };
+        // Groups are an interactivity feature of GPUI's own elements.
+        if !(spec.expression.starts_with("gpui::div()")
+            || spec.expression.starts_with("gpui::img("))
+        {
+            return;
+        }
+        push_method(expression, 0, &format!(".group({name:?})"));
+        self.emitted_groups.insert(address);
+    }
+
+    /// A state variant from the typed lowering: the GPUI state method with
+    /// its style closure, and whether GPUI applies it only approximately.
+    fn typed_variant_method(
+        &mut self,
+        element: &RenderElement,
+        variant: &RenderStyleVariant,
+        computed: &ComputedScope,
+        parent: &ComputedScope,
+        whole: &ComputedStyle,
+    ) -> Option<(String, bool)> {
+        let address = std::ptr::from_ref::<RenderElement>(element) as usize;
+        let (trigger, approximate_trigger) = self.variant_trigger(address, &variant.conditions)?;
+        if variant
+            .declarations
+            .iter()
+            .any(|style| self.uses_theme_binding(style))
+        {
+            return None;
+        }
+        let resolved = variant
+            .declarations
+            .iter()
+            .map(|declaration| {
+                computed
+                    .resolve(declaration)
+                    .map(std::borrow::Cow::into_owned)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut unsupported = false;
+        let style = ComputedStyle::compute(&resolved, &computed.style_context(parent), |_, _| {
+            unsupported = true;
+        });
+        if unsupported {
+            return None;
+        }
+        let planned = plan_within(&style, whole, self.style_printer.features);
+        let methods = self.style_printer.methods(&planned);
+        if methods.is_empty() {
+            return None;
+        }
+        let approximate =
+            approximate_trigger || !planned.approximations.is_empty() || !planned.limits.is_empty();
+        Some((
+            format!("{trigger}|this| {})", refinement_closure_body(&methods)),
+            approximate,
+        ))
+    }
+
+    /// The GPUI method a variant's conditions select, up to its closure
+    /// argument, and whether GPUI matches them only approximately.
+    fn variant_trigger(
+        &self,
+        address: usize,
+        conditions: &[RenderStyleCondition],
+    ) -> Option<(String, bool)> {
+        let states = conditions
+            .iter()
+            .filter(|condition| {
+                matches!(
+                    condition,
+                    RenderStyleCondition::PseudoClass(_)
+                        | RenderStyleCondition::ElementState { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        let [state] = states.as_slice() else {
+            return None;
+        };
+        let pseudo = match state {
+            RenderStyleCondition::PseudoClass(pseudo)
+            | RenderStyleCondition::ElementState { pseudo, .. } => pseudo.as_str(),
+            _ => return None,
+        };
+        let other_conditions_hold = conditions.iter().all(|condition| match condition {
+            RenderStyleCondition::PseudoClass(_) | RenderStyleCondition::ElementState { .. } => {
+                true
+            }
+            RenderStyleCondition::Media(query) => interaction_media_allows(query, pseudo),
+            _ => false,
+        });
+        if !other_conditions_hold {
+            return None;
+        }
+        match state {
+            RenderStyleCondition::PseudoClass(_) => {
+                let method = match pseudo {
+                    "hover" => "hover",
+                    "active" => "active",
+                    "focus" | "focus-visible" => "focus",
+                    _ => return None,
+                };
+                Some((format!(".{method}("), false))
+            }
+            RenderStyleCondition::ElementState {
+                ancestor,
+                negated: false,
+                ..
+            } => match pseudo {
+                "hover" | "active" => {
+                    let target = self.group_targets.get(&(address, *ancestor))?;
+                    if !self.emitted_groups.contains(target) {
+                        return None;
+                    }
+                    let name = self.group_names.get(target)?;
+                    Some((format!(".group_{pseudo}({name:?}, "), false))
+                }
+                // GPUI knows only that some ancestor is focused, not which.
+                "focus" | "focus-visible" | "focus-within" => Some((".in_focus(".to_owned(), true)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Whether a declaration reads a theme token this component binds to the
@@ -6179,7 +6391,12 @@ fn style_variant_needs_stateful_id(variant: &RenderStyleVariant) -> bool {
     matches!(
         dynamic_style_method_name(&variant.conditions),
         Some("active" | "focus")
-    )
+    ) || variant.conditions.iter().any(|condition| {
+        matches!(
+            condition,
+            RenderStyleCondition::ElementState { pseudo, negated: false, .. } if pseudo == "active"
+        )
+    })
 }
 
 fn pseudo_element_emits_as_child(pseudo: &RenderPseudoElement, kind: &str) -> bool {
@@ -6206,6 +6423,33 @@ fn pseudo_element_preservation_reason(
     }
 
     "this pseudo-element could not be emitted by the selected adapter".to_owned()
+}
+
+/// The body of a `StyleRefinement` closure applying printed methods. Field
+/// assignments, printed for elements as `.map(|mut this| { ..; this })`,
+/// become statements, as refinements have no `map`.
+fn refinement_closure_body(methods: &[String]) -> String {
+    const ASSIGNMENT: (&str, &str) = (".map(|mut this| { ", " this })");
+    let mut calls = Vec::new();
+    let mut statements = Vec::new();
+    for method in methods {
+        match method
+            .strip_prefix(ASSIGNMENT.0)
+            .and_then(|rest| rest.strip_suffix(ASSIGNMENT.1))
+        {
+            Some(statement) => statements.push(statement.to_owned()),
+            None => calls.push(method.clone()),
+        }
+    }
+    let chained = chain_style_methods("this", &calls);
+    if statements.is_empty() {
+        chained
+    } else {
+        format!(
+            "{{ let mut this = {chained}; {} this }}",
+            statements.join(" ")
+        )
+    }
 }
 
 fn chain_style_methods(base: &str, methods: &[String]) -> String {

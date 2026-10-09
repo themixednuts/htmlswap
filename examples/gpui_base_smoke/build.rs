@@ -40,6 +40,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    // The view exercises these emission paths; compiling them is the point.
+    for expected in [
+        ".group_hover(",
+        ".group_active(",
+        ".in_focus(",
+        "htmlswap_rem_size",
+        "htmlswap_viewport",
+        "gpui::BoxShadow",
+    ] {
+        if !output.code().contains(expected) {
+            return Err(format!("generated view lacks `{expected}`").into());
+        }
+    }
+
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
     fs::write(out_dir.join("base_smoke_view.rs"), output.code())?;
 
